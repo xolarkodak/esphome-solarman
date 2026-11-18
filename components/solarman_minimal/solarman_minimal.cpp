@@ -25,115 +25,53 @@ namespace solarman_minimal {
 
 static const char *const TAG = "solarman";
 
-// ── Register map – Deye hybrid (SUN-xK-SG0xLPx) ───────────────────────────
+// ── Register maps ─────────────────────────────────────────────────────────
 //
-// Taken from the `deye_hybrid` profile of the ha-solarman integration, which
-// is in production use against a Deye 8K SG05LP1. Verified against that
-// project's own parser for the multi-register (32-bit) decoding order.
+// The C++ side holds NO register addresses. Each sensor arrives from codegen
+// with one definition per model family (address, type, scale, offset, flags),
+// taken from the profile tables in __init__.py. At runtime the model is picked
+// - read from register 0x0000 or forced in YAML - and plan_blocks() turns the
+// registers the configured sensors actually need into as few Modbus reads as
+// possible. A config with five sensors reads five sensors' worth of blocks; a
+// new model family is a new column in a Python table, not new C++.
 //
-// Read in TWO batches rather than one connection per quantity. update() runs on
-// the main loop, and four sequential TCP round-trips measured 1427 ms on real
-// hardware — long enough for ESPHome to warn, and long enough to disturb a BLE
-// stack sharing the same device.
+// History worth keeping, from the single-phase map this started as:
 //
-// Batch 1  as first field-confirmed: 0x003B..0x006F (53 regs) - state, daily
-//          counters, energy totals. Index [i] = 0x003B + i. Now wider, see below.
-//   [ 0]      0x003B = Device State, enum: 0 standby, 1 self-test, 2 normal,
-//                      3 alarm, 4 fault
-//   [11]      0x0046 = Daily Battery Charge    x0.1 kWh
-//   [12]      0x0047 = Daily Battery Discharge x0.1 kWh
-//   [17]      0x004C = Daily Energy Bought     x0.1 kWh
-//   [18]      0x004D = Daily Energy Sold       x0.1 kWh
-//   [25]      0x0054 = Daily Load Consumption  x0.1 kWh
-//   [26]+[27] 0x0055/0x0056 = Total Load Consumption x0.1 kWh, 32-bit UNSIGNED,
-//                             first register is the LOW word.
-//   [37]+[38] 0x0060/0x0061 = Total Production      x0.1 kWh, 32-bit UNSIGNED,
-//                             first register is the LOW word.
-//   [49]      0x006C = Daily Production x0.1 kWh
-//   [50]      0x006D = PV1 Voltage      x0.1 V
-//   [52]      0x006F = PV2 Voltage      x0.1 V
+// Read in as FEW requests as possible. update() used to run on the main loop,
+// and four sequential TCP round-trips measured 1427 ms on real hardware -
+// long enough for ESPHome to warn, and long enough to disturb a BLE stack
+// sharing the same device. A Modbus read costs one round trip whatever its
+// length, so blocks are merged across gaps (MAX_GAP) up to max_block_size.
+// Blocks are now also read one per loop() pass instead of all inside one
+// update(), so a slow logger stalls the screen for one read at a time.
 //
-// Batch 2  as first field-confirmed: 0x00A9..0x00C2 (26 regs). Index [i] =
-//          0x00A9 + i. Now starts lower, see below.
-//   [0]  0x00A9 = Grid Power      W  signed
-//   [9]  0x00B2 = Load Power      W  signed
-//   [14] 0x00B7 = Battery Voltage ×0.01 V
-//   [15] 0x00B8 = Battery SOC     %
-//   [17] 0x00BA = PV1 Power       W
-//   [18] 0x00BB = PV2 Power       W
-//   [21] 0x00BE = Battery Power   W  signed, POSITIVE = DISCHARGING
-//   [25] 0x00C2 = Grid connected, non-zero = tied to the utility
-//
-// Both ranges were WIDENED rather than adding a third batch. A Modbus read
-// costs one TCP round trip whatever its length, so 53 registers cost what 16
-// cost, while a third connection would add roughly 350 ms to the main loop -
-// the very budget the two-batch split was made to protect.
-//
-// Confirmed against a Deye 8K SG05LP1 on 2026-08-22:
+// Confirmed against a Deye 8K SG05LP1 on 2026-08-22 (single-phase map):
 //   * Battery voltage scale 0.01 (read 52.3 V on a 48 V bank).
 //   * Grid/Load power scale is 1, not the 10 the upstream profile's
-//     `scale: [1, 10, 10]` hints at — 2705 W of load on an 8 kW inverter.
+//     `scale: [1, 10, 10]` hints at - 2705 W of load on an 8 kW inverter.
 //   * 32-bit word order (760.5 kWh total; reversed would read in the millions).
-//   * Battery power sign: at 19:39 with PV at 2 W, grid at 0 W and load at
-//     2705 W, the battery must have been discharging, and the register read
-//     +2813 W. The 108 W difference is inverter self-consumption. So a
-//     positive value means DISCHARGE — the opposite of what was documented
-//     here before.
+//   * Battery power sign: positive = DISCHARGE (+2813 W with PV at 2 W, grid
+//     at 0 W and load at 2705 W).
+// And on a SUN-6K-SG05LP1 (fork, 2026-11): values match the ha-solarman
+// deye_hybrid profile in Home Assistant.
 //
-// Still open: the Grid Power sign convention. It read 0 W during the test, so
-// nothing could be inferred. Reading the upstream source does not settle it
-// either — the profile marks the sensor `attributes: [inverse]` while the
-// parser tests a differently-named key, `inverted`. To be settled by comparing
-// against a working integration during grid import or export.
-//
-// Extended (fork, 2026-11): both batches widened once more instead of adding a
-// third connection, for the same reason as above.
-//   Batch 1 now runs to 0x0074 to pick up PV1-PV4 current and PV3/PV4 voltage
-//   (Deye Modbus map: 109..116 = DC voltage/current 1..4, x0.1).
-//   Batch 2 now starts at 0x0096 (grid-side voltage L1-N, x0.1 V) and runs to
-//   0x00CC (configured battery capacity, Ah). 0x0096..0x00F8 is the range the
-//   ha-solarman deye_hybrid profile reads in ONE request, so the logger is known
-//   to accept a frame this size.
-//
-// Every value is now looked up by its register address rather than by an index
-// into the batch, so widening a batch can never silently shift a sensor onto
-// the wrong register again.
-static const uint16_t REG_BATCH1_START = 0x003B;
-static const uint8_t  REG_BATCH1_COUNT = 58;  // through 0x0074
-static const uint16_t REG_BATCH2_START = 0x0096;
-static const uint8_t  REG_BATCH2_COUNT = 55;  // through 0x00CC
+// Still open: the Grid Power sign convention, and everything about the
+// three-phase maps, which come from documentation and community profiles and
+// have not been checked against live hardware.
 
-// Batch 1
-static const uint16_t REG_DEVICE_STATE        = 0x003B;
-static const uint16_t REG_DAILY_BATT_CHARGE   = 0x0046;
-static const uint16_t REG_DAILY_BATT_DISCHG   = 0x0047;
-static const uint16_t REG_DAILY_BOUGHT        = 0x004C;
-static const uint16_t REG_DAILY_SOLD          = 0x004D;
-static const uint16_t REG_GRID_FREQUENCY      = 0x004F;  // x0.01 Hz
-static const uint16_t REG_DAILY_LOAD          = 0x0054;
-static const uint16_t REG_TOTAL_LOAD_LO       = 0x0055;  // + 0x0056 high word
-static const uint16_t REG_TOTAL_PRODUCTION_LO = 0x0060;  // + 0x0061 high word
-static const uint16_t REG_DAILY_PRODUCTION    = 0x006C;
-static const uint16_t REG_PV1_VOLTAGE         = 0x006D;  // PVn voltage = 0x006D + 2(n-1)
-static const uint16_t REG_PV1_CURRENT         = 0x006E;  // PVn current = 0x006E + 2(n-1)
-// Batch 2
-static const uint16_t REG_GRID_VOLTAGE        = 0x0096;  // x0.1 V, grid side L1-N
-static const uint16_t REG_GRID_POWER          = 0x00A9;
-static const uint16_t REG_LOAD_POWER          = 0x00B2;
-static const uint16_t REG_BATTERY_TEMP        = 0x00B6;  // x0.1 C, offset +100 C
-static const uint16_t REG_BATTERY_VOLTAGE     = 0x00B7;
-static const uint16_t REG_BATTERY_SOC         = 0x00B8;
-static const uint16_t REG_PV1_POWER           = 0x00BA;  // PVn power = 0x00BA + (n-1)
-static const uint16_t REG_BATTERY_POWER       = 0x00BE;
-static const uint16_t REG_BATTERY_CURRENT     = 0x00BF;  // x0.01 A signed
-static const uint16_t REG_GRID_CONNECTED      = 0x00C2;
-static const uint16_t REG_BATTERY_CAPACITY    = 0x00CC;  // Ah, as set on the inverter
+// Device type register, common to every Deye family. Low byte:
+// 2 string inverter, 3 single-phase hybrid, 4 microinverter,
+// 5 three-phase LV hybrid, 6 three-phase HV hybrid.
+static const uint16_t REG_DEVICE_TYPE = 0x0000;
+// Registers this far apart are still read in one request: reading 32 unused
+// registers costs ~64 bytes, a second request costs a whole TCP round trip.
+static const uint16_t MAX_GAP = 32;
+// Slow registers (settings such as battery capacity) are refreshed on the
+// first poll and then every SLOW_EVERY polls - 10 minutes at 30 s.
+static const uint32_t SLOW_EVERY = 20;
 
-// Register `addr` out of a batch that starts at `start`. The batch length is
-// guaranteed by read_registers(), and the constants above are all in range.
-static inline uint16_t at(const std::vector<uint16_t> &b, uint16_t start, uint16_t addr) {
-  return b[addr - start];
-}
+static const char *const MODEL_NAMES[] = {"single-phase LV hybrid", "three-phase LV hybrid",
+                                          "three-phase HV hybrid"};
 
 // millis() wraps after ~49.7 days, and a screen on the wall runs that long.
 // `millis() < deadline` breaks at the wrap; a signed difference does not.
@@ -182,6 +120,10 @@ void SolarmanMinimal::setup() {
 void SolarmanMinimal::dump_config() {
   ESP_LOGCONFIG(TAG, "Solarman:");
   ESP_LOGCONFIG(TAG, "  Serial: %" PRIu32, serial_);
+  ESP_LOGCONFIG(TAG, "  Model: %s", model_cfg_ == MODEL_AUTO ? "auto (from register 0x0000)"
+                                                             : MODEL_NAMES[model_cfg_]);
+  ESP_LOGCONFIG(TAG, "  Sensors: %u, max block %u registers", (unsigned) bindings_.size(),
+                (unsigned) max_block_size_);
   if (host_override_) {
     ESP_LOGCONFIG(TAG, "  Host: %s (manual)", host_str().c_str());
   } else if (has_host()) {
@@ -248,28 +190,32 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
 // nothing is left failed - the person who pressed the button decides whether
 // to try again, rather than the device retrying on its own.
 void SolarmanMinimal::loop() {
-  if (!scan_fast_)
-    return;
   if (!wifi::global_wifi_component->is_connected())
     return;
 
-  if (tcp_scan_step()) {
-    scan_fast_ = false;
-    scan_state_ = SCAN_FOUND;
-    ESP_LOGI(TAG, "Search finished: %s", status_line().c_str());
-    return;
+  if (scan_fast_) {
+    if (tcp_scan_step()) {
+      scan_fast_ = false;
+      scan_state_ = SCAN_FOUND;
+      ESP_LOGI(TAG, "Search finished: %s", status_line().c_str());
+      return;
+    }
+    if (scan_wrapped_) {
+      scan_fast_ = false;
+      scan_state_ = SCAN_FAILED;
+      // Nothing found - put back whatever start_scan() had before it cleared
+      // host_addr_/serial_ to zero for the sweep. A search that finds nothing
+      // should report failure, not also break a connection that was already
+      // working.
+      host_addr_ = scan_saved_host_;
+      serial_ = scan_saved_serial_;
+      ESP_LOGW(TAG, "Search finished: nothing answering on port %u", SOLARMAN_PORT);
+    }
+    return;  // no polling while a sweep owns the network
   }
-  if (scan_wrapped_) {
-    scan_fast_ = false;
-    scan_state_ = SCAN_FAILED;
-    // Nothing found - put back whatever start_scan() had before it cleared
-    // host_addr_/serial_ to zero for the sweep. A search that finds nothing
-    // should report failure, not also break a connection that was already
-    // working.
-    host_addr_ = scan_saved_host_;
-    serial_ = scan_saved_serial_;
-    ESP_LOGW(TAG, "Search finished: nothing answering on port %u", SOLARMAN_PORT);
-  }
+
+  if (round_active_)
+    round_step();
 }
 
 void SolarmanMinimal::update() {
@@ -277,15 +223,16 @@ void SolarmanMinimal::update() {
     ESP_LOGD(TAG, "WiFi down - skipping poll");
     return;
   }
+  if (scan_fast_)
+    return;
+  if (round_active_) {
+    ESP_LOGW(TAG, "Previous poll still running - update_interval may be too short");
+    return;
+  }
 
   // Find the logger if we do not have it. Two mechanisms, tried in order and
   // both optional: the UDP probe, which no dongle has ever answered, and the
   // subnet scan, which has.
-  //
-  // Rewritten because the first version ran the UDP probe even after the scan
-  // had just succeeded - a wasted second and a "not found on LAN" warning
-  // logged immediately below "Logger confirmed at", which reads like a
-  // contradiction.
   if (serial_ == 0 || !has_host()) {
     uint32_t now = millis();
     // A failed probe is not retried on the next poll: it blocks the main loop
@@ -304,91 +251,290 @@ void SolarmanMinimal::update() {
         ESP_LOGW(TAG, "Discovery failed - next attempt in %u s",
                  (unsigned) (DISCOVERY_RETRY / 1000));
     }
-
-    // No automatic subnet scan here: it used to run a few addresses every
-    // poll, forever, while unconfigured - real TCP connections to every host
-    // on someone else's LAN, indefinitely. The scan now runs only from
-    // start_scan() (see loop()), a single sweep per button press.
-
-    // Still nothing to talk to, or nothing to identify ourselves with.
+    // No automatic subnet scan here: it runs only from start_scan().
     if (!has_host() || serial_ == 0)
       return;
   }
 
-  // ── Batch 2 first: grid, load, battery, PV power ────────────────────────
-  // Read first because it drives the failure counter and carries the values
-  // that matter most; if the inverter is unreachable, skip the rest.
-  std::vector<uint16_t> b2;
-  if (!read_registers(REG_BATCH2_START, REG_BATCH2_COUNT, b2)) {
-    consecutive_failures_++;
-    ESP_LOGW(TAG, "Read failed (%u/%u)", consecutive_failures_, MAX_FAILURES);
-    if (consecutive_failures_ >= MAX_FAILURES && !host_override_) {
-      ESP_LOGW(TAG, "Dropping cached IP - re-discovering next cycle");
-      host_addr_ = 0;
-      consecutive_failures_ = 0;
+  poll_count_++;
+  if (!select_model())
+    return;  // the logger did not answer at all - counted as a failure
+
+  round_active_ = true;
+  round_next_ = 0;
+  round_any_ok_ = false;
+  for (auto &b : blocks_)
+    b.fresh = false;
+}
+
+// ── Model selection ───────────────────────────────────────────────────────
+//
+// Returns false only when the logger could not be reached, so update() can
+// skip the poll. An unreadable or unknown device type is NOT fatal: it falls
+// back to the single-phase map - what this component always used - and the
+// detection is retried every SLOW_EVERY polls.
+
+bool SolarmanMinimal::select_model() {
+  int8_t want = model_;
+  if (model_cfg_ != MODEL_AUTO) {
+    want = model_cfg_;
+  } else {
+    bool known = model_detected_ && detected_serial_ == serial_;
+    bool retry_due = model_ == MODEL_AUTO || detected_serial_ != serial_ ||
+                     (poll_count_ - detect_attempt_poll_) >= SLOW_EVERY;
+    if (!known && retry_due) {
+      detect_attempt_poll_ = poll_count_;
+      std::vector<uint16_t> r;
+      if (read_registers(REG_DEVICE_TYPE, 1, r)) {
+        device_type_raw_ = r[0];
+        if (device_type_sensor_ != nullptr)
+          device_type_sensor_->publish_state(r[0]);
+        switch (r[0] & 0xFF) {
+          case 3: want = MODEL_SINGLE_PHASE_LV; break;
+          case 5: want = MODEL_THREE_PHASE_LV; break;
+          case 6: want = MODEL_THREE_PHASE_HV; break;
+          default:
+            want = MODEL_SINGLE_PHASE_LV;
+            ESP_LOGW(TAG, "Device type 0x%04X is not a known Deye hybrid - using the single-phase "
+                          "map. Set `model:` in YAML if that is wrong.", r[0]);
+            break;
+        }
+        model_detected_ = true;
+        detected_serial_ = serial_;
+      } else if (model_ == MODEL_AUTO) {
+        // Nothing came back at all on the very first contact: treat it as an
+        // unreachable logger, exactly like a failed data read.
+        note_failure();
+        return false;
+      } else {
+        ESP_LOGW(TAG, "Could not read the device type - keeping the %s map for now",
+                 MODEL_NAMES[model_]);
+      }
     }
-    return;
-  }
-  consecutive_failures_ = 0;
-  clear_error();
-  auto r2 = [&](uint16_t addr) { return at(b2, REG_BATCH2_START, addr); };
-
-  if (grid_voltage_)    grid_voltage_->publish_state(r2(REG_GRID_VOLTAGE) * 0.1f);
-  if (grid_power_)      publish_signed(grid_power_, r2(REG_GRID_POWER));
-  if (load_power_)      publish_signed(load_power_, r2(REG_LOAD_POWER));
-  if (battery_voltage_) battery_voltage_->publish_state(r2(REG_BATTERY_VOLTAGE) * 0.01f);
-  if (battery_soc_)     battery_soc_->publish_state(r2(REG_BATTERY_SOC));
-  if (battery_power_)   publish_signed(battery_power_, r2(REG_BATTERY_POWER));
-  // Same sign as battery_power: positive = discharging.
-  if (battery_current_)
-    battery_current_->publish_state((int16_t) r2(REG_BATTERY_CURRENT) * 0.01f);
-  // Stored with a +100 C offset so sub-zero readings stay unsigned: 1000 = 0 C.
-  // 0 means "no sensor" (lead-acid without a probe, BMS not talking) - publish
-  // NaN rather than a convincing -100 C.
-  if (battery_temperature_) {
-    uint16_t raw = r2(REG_BATTERY_TEMP);
-    battery_temperature_->publish_state(raw == 0 ? NAN : raw * 0.1f - 100.0f);
-  }
-  if (battery_capacity_ || battery_capacity_energy_) {
-    uint16_t ah = r2(REG_BATTERY_CAPACITY);
-    if (battery_capacity_) battery_capacity_->publish_state(ah);
-    if (battery_capacity_energy_)
-      battery_capacity_energy_->publish_state(ah * battery_nominal_voltage_ / 1000.0f);
+    if (want == MODEL_AUTO)
+      want = MODEL_SINGLE_PHASE_LV;
   }
 
+  if (want != model_) {
+    model_ = want;
+    ESP_LOGI(TAG, "Inverter model: %s%s (device type 0x%04X)", MODEL_NAMES[model_],
+             model_cfg_ == MODEL_AUTO ? "" : " - set in YAML", device_type_raw_);
+    plan_blocks();
+  }
+  return true;
+}
+
+const char *SolarmanMinimal::model_name() const {
+  return model_ == MODEL_AUTO ? "unknown" : MODEL_NAMES[model_];
+}
+
+// ── Block planner ─────────────────────────────────────────────────────────
+//
+// Turns the registers that the configured sensors need, for the selected
+// model, into Modbus reads. Fast registers are grouped first; a slow one that
+// fits into a fast block (within MAX_GAP and max_block_size) rides along for
+// free, and only the rest get blocks of their own, read every SLOW_EVERY polls.
+
+static bool try_extend(SolarmanMinimal::Block &blk, uint16_t r, uint8_t max_size) {
+  uint16_t end = blk.start + blk.count - 1;
+  if (r >= blk.start && r <= end)
+    return true;
+  if (r > end && r - end <= MAX_GAP && r - blk.start + 1 <= max_size) {
+    blk.count = r - blk.start + 1;
+    return true;
+  }
+  if (r < blk.start && blk.start - r <= MAX_GAP && end - r + 1 <= max_size) {
+    blk.count = end - r + 1;
+    blk.start = r;
+    return true;
+  }
+  return false;
+}
+
+void SolarmanMinimal::plan_blocks() {
+  std::vector<uint16_t> fast, slow;
+  unsigned unsupported = 0;
+  for (auto &b : bindings_) {
+    if (!b.has[model_]) {
+      if (b.entity != nullptr)
+        unsupported++;
+      continue;
+    }
+    const RegDef &d = b.def[model_];
+    auto &dst = (d.flags & FLAG_SLOW) ? slow : fast;
+    dst.push_back(d.reg);
+    if (d.type >= TYPE_U32)
+      dst.push_back(d.reg + 1);
+  }
+  for (auto *v : {&fast, &slow}) {
+    std::sort(v->begin(), v->end());
+    v->erase(std::unique(v->begin(), v->end()), v->end());
+  }
+
+  blocks_.clear();
+  // Fast registers arrive sorted, so only the newest block can grow.
+  for (uint16_t r : fast) {
+    if (blocks_.empty() || !try_extend(blocks_.back(), r, max_block_size_)) {
+      Block nb;
+      nb.start = r;
+      nb.count = 1;
+      blocks_.push_back(nb);
+    }
+  }
+  const size_t n_fast = blocks_.size();
+  for (uint16_t r : slow) {
+    bool placed = false;
+    // Free ride on a fast block first...
+    for (size_t i = 0; i < n_fast && !placed; i++)
+      placed = try_extend(blocks_[i], r, max_block_size_);
+    // ...then the newest slow block, then a block of its own.
+    if (!placed && blocks_.size() > n_fast)
+      placed = try_extend(blocks_.back(), r, max_block_size_);
+    if (!placed) {
+      Block nb;
+      nb.start = r;
+      nb.count = 1;
+      nb.slow = true;
+      blocks_.push_back(nb);
+    }
+  }
+
+  ESP_LOGI(TAG, "Read plan for %s: %u block(s)", MODEL_NAMES[model_], (unsigned) blocks_.size());
+  for (auto &blk : blocks_)
+    ESP_LOGI(TAG, "  0x%04X..0x%04X (%u regs)%s", blk.start, blk.start + blk.count - 1, blk.count,
+             blk.slow ? "  slow" : "");
+  if (unsupported)
+    ESP_LOGW(TAG, "%u configured sensor(s) have no register on a %s and will stay unknown",
+             unsupported, MODEL_NAMES[model_]);
+}
+
+// ── One poll, spread over loop() ──────────────────────────────────────────
+
+void SolarmanMinimal::note_failure() {
+  consecutive_failures_++;
+  ESP_LOGW(TAG, "Read failed (%u/%u)", consecutive_failures_, MAX_FAILURES);
+  if (consecutive_failures_ >= MAX_FAILURES && !host_override_) {
+    ESP_LOGW(TAG, "Dropping cached IP - re-discovering next cycle");
+    host_addr_ = 0;
+    consecutive_failures_ = 0;
+  }
+}
+
+void SolarmanMinimal::round_step() {
+  // Skip slow blocks that are not due. A slow block that has never been read
+  // (last_ok_poll == 0) is always due.
+  while (round_next_ < blocks_.size()) {
+    Block &blk = blocks_[round_next_];
+    if (!blk.slow || blk.last_ok_poll == 0 || (poll_count_ - blk.last_ok_poll) >= SLOW_EVERY)
+      break;
+    round_next_++;
+  }
+
+  if (round_next_ < blocks_.size()) {
+    Block &blk = blocks_[round_next_];
+    if (read_registers(blk.start, blk.count, blk.data)) {
+      blk.fresh = true;
+      blk.last_ok_poll = poll_count_;
+      if (!round_any_ok_) {
+        round_any_ok_ = true;
+        consecutive_failures_ = 0;
+        clear_error();
+      }
+    } else if (!round_any_ok_) {
+      // The first read of the poll failed: the logger is unreachable or busy.
+      // Do not hammer it with the remaining blocks.
+      note_failure();
+      round_active_ = false;
+      return;
+    } else {
+      ESP_LOGW(TAG, "Block 0x%04X failed - its sensors keep their last value", blk.start);
+    }
+    round_next_++;
+    if (round_next_ < blocks_.size())
+      return;  // next block on the next loop() pass
+  }
+
+  round_active_ = false;
+  publish_round();
+}
+
+bool SolarmanMinimal::lookup(uint16_t reg, uint16_t &out) const {
+  for (const auto &blk : blocks_) {
+    if (blk.fresh && reg >= blk.start && reg < blk.start + blk.count && blk.data.size() == blk.count) {
+      out = blk.data[reg - blk.start];
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SolarmanMinimal::decode(const RegDef &d, float &value) const {
+  uint16_t lo = 0, hi = 0;
+  if (!lookup(d.reg, lo))
+    return false;
+  if (d.type >= TYPE_U32 && !lookup(d.reg + 1, hi))
+    return false;
+  double raw;
+  switch (d.type) {
+    case TYPE_S16: raw = (int16_t) lo; break;
+    // Deye stores 32-bit counters low word FIRST (confirmed: 760.5 kWh total,
+    // reversed it reads in the millions). The _BE types are for custom
+    // registers on devices that do it the other way round.
+    case TYPE_U32: raw = (uint32_t) lo | ((uint32_t) hi << 16); break;
+    case TYPE_S32: raw = (int32_t) ((uint32_t) lo | ((uint32_t) hi << 16)); break;
+    case TYPE_U32_BE: raw = ((uint32_t) lo << 16) | hi; break;
+    case TYPE_S32_BE: raw = (int32_t) (((uint32_t) lo << 16) | hi); break;
+    default: raw = lo; break;
+  }
+  if ((d.flags & FLAG_ZERO_IS_NAN) && raw == 0) {
+    value = NAN;
+  } else if (d.flags & FLAG_BOOL) {
+    value = raw != 0 ? 1.0f : 0.0f;
+  } else {
+    value = (float) (raw * d.scale + d.offset);
+  }
+  return true;
+}
+
+void SolarmanMinimal::publish_round() {
   float pv_sum = 0;
-  for (uint8_t n = 0; n < 4; n++) {
-    uint16_t w = r2(REG_PV1_POWER + n);
-    pv_sum += w;
-    if (pv_power_sensors_[n]) pv_power_sensors_[n]->publish_state(w);
-  }
-  if (pv_power_) pv_power_->publish_state(pv_sum);
-  // Published as 0/1 rather than a binary_sensor: this component builds its own
-  // entities, and a numeric sensor keeps every consumer on one code path.
-  if (grid_connected_)  grid_connected_->publish_state(r2(REG_GRID_CONNECTED) != 0 ? 1.0f : 0.0f);
-
-  // ── Batch 1: state, daily counters, energy totals, PV voltage/current ───
-  std::vector<uint16_t> b1;
-  if (read_registers(REG_BATCH1_START, REG_BATCH1_COUNT, b1)) {
-    auto r1 = [&](uint16_t addr) { return at(b1, REG_BATCH1_START, addr); };
-    auto r1_u32 = [&](uint16_t lo) { return (uint32_t) r1(lo) | ((uint32_t) r1(lo + 1) << 16); };
-
-    if (device_state_)            device_state_->publish_state(r1(REG_DEVICE_STATE));
-    if (grid_frequency_)          grid_frequency_->publish_state(r1(REG_GRID_FREQUENCY) * 0.01f);
-    if (daily_battery_charge_)    daily_battery_charge_->publish_state(r1(REG_DAILY_BATT_CHARGE) * 0.1f);
-    if (daily_battery_discharge_) daily_battery_discharge_->publish_state(r1(REG_DAILY_BATT_DISCHG) * 0.1f);
-    if (daily_energy_bought_)     daily_energy_bought_->publish_state(r1(REG_DAILY_BOUGHT) * 0.1f);
-    if (daily_energy_sold_)       daily_energy_sold_->publish_state(r1(REG_DAILY_SOLD) * 0.1f);
-    if (daily_consumption_)       daily_consumption_->publish_state(r1(REG_DAILY_LOAD) * 0.1f);
-    if (total_consumption_)       total_consumption_->publish_state(r1_u32(REG_TOTAL_LOAD_LO) * 0.1f);
-    if (total_production_)        total_production_->publish_state(r1_u32(REG_TOTAL_PRODUCTION_LO) * 0.1f);
-    if (daily_production_)        daily_production_->publish_state(r1(REG_DAILY_PRODUCTION) * 0.1f);
-    for (uint8_t n = 0; n < 4; n++) {
-      if (pv_voltage_sensors_[n])
-        pv_voltage_sensors_[n]->publish_state(r1(REG_PV1_VOLTAGE + 2 * n) * 0.1f);
-      if (pv_current_sensors_[n])
-        pv_current_sensors_[n]->publish_state(r1(REG_PV1_CURRENT + 2 * n) * 0.1f);
+  bool pv_any = false;
+  bool soc_fresh = false;
+  for (auto &b : bindings_) {
+    if (!b.has[model_])
+      continue;
+    float v;
+    if (!decode(b.def[model_], v))
+      continue;  // block missing this poll - leave the last state alone
+    b.last = v;
+    if (b.entity != nullptr)
+      b.entity->publish_state(v);
+    if (b.role == ROLE_PV_SUM && !std::isnan(v)) {
+      pv_sum += v;
+      pv_any = true;
+    } else if (b.role == ROLE_SOC) {
+      soc_fresh = true;
     }
+  }
+
+  // ── Derived values ──
+  if (pv_power_ != nullptr && pv_any)
+    pv_power_->publish_state(pv_sum);
+
+  float cap_ah = NAN, soc = NAN;
+  for (const auto &b : bindings_) {
+    if (b.role == ROLE_CAPACITY_AH)
+      cap_ah = b.last;  // a slow register: the last good value is fine
+    else if (b.role == ROLE_SOC)
+      soc = b.last;
+  }
+  if (!std::isnan(cap_ah) && cap_ah > 0) {
+    float kwh = cap_ah * battery_nominal_voltage_ / 1000.0f;
+    if (battery_capacity_energy_ != nullptr)
+      battery_capacity_energy_->publish_state(kwh);
+    // What is in the battery right now: capacity x state of charge.
+    if (battery_remaining_energy_ != nullptr && soc_fresh && !std::isnan(soc))
+      battery_remaining_energy_->publish_state(kwh * soc / 100.0f);
   }
 }
 
@@ -413,21 +559,25 @@ void SolarmanMinimal::scan_registers() {
     uint8_t count;
     const char *label;
   };
-  // The first four ranges cover the whole verified deye_hybrid map, so a scan
-  // confirms every sensor this component publishes. The rest are a wider sweep
-  // for other Deye variants whose layout differs.
+  // Every range any built-in profile reads, plus a few neighbours. A scan is
+  // how a new model is checked: compare the log with the inverter's display
+  // and with the profile tables in __init__.py.
   static const Range ranges[] = {
-      {0x003B, 10, "Time / status"},
-      {0x0046, 10, "Daily battery / grid counters, grid frequency 0x004F"},
-      {0x0054, 14, "Energy totals (incl. 0x0060 total production)"},
-      {0x0068, 13, "Daily yield + PV1-PV4 voltage / current"},
-      {0x0096, 16, "Grid voltage / current"},
-      {0x00A5, 28, "Grid power, load power, battery, PV1-PV4 power"},
-      {0x00C0, 16, "Battery extras, battery capacity 0x00CC"},
-      {0x00E0, 16, "Grid meter"},
-      {0x0202, 24, "Alternative layout: energy"},
-      {0x0244, 20, "Alternative layout: battery / PV"},
-      {0x0258, 24, "Alternative layout: grid / load"},
+      {0x0000, 16, "All: device type 0x0000, rated power, serial"},
+      {0x003B, 10, "1P: time / status"},
+      {0x0046, 10, "1P: daily battery / grid counters, grid frequency 0x004F"},
+      {0x0054, 14, "1P: energy totals (incl. 0x0060 total production)"},
+      {0x0060, 12, "3P: battery settings, capacity 0x0066"},
+      {0x0068, 13, "1P: daily yield + PV1-PV4 voltage / current"},
+      {0x0096, 16, "1P: grid voltage / current"},
+      {0x00A5, 28, "1P: grid power, load power, battery, PV1-PV4 power"},
+      {0x00C0, 16, "1P: battery extras, battery capacity 0x00CC"},
+      {0x01F4, 8, "3P: device state 0x01F4"},
+      {0x0202, 24, "3P: energy counters"},
+      {0x024A, 16, "3P: battery, grid voltage L1-L3"},
+      {0x0261, 20, "3P: grid frequency, grid power"},
+      {0x0286, 10, "3P: load power L1-L3 / total"},
+      {0x02A0, 12, "3P: PV1-PV4 power, voltage, current"},
   };
 
   ESP_LOGI(TAG, "===== REGISTER SCAN START =====");
@@ -517,7 +667,7 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
   std::vector<uint16_t> probe;
   // One register is enough to tell a Solarman logger from anything else that
   // happens to listen on 8899.
-  if (read_registers(REG_BATCH2_START, 1, probe)) {
+  if (read_registers(REG_DEVICE_TYPE, 1, probe)) {
     ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
     clear_error();
     save_host();
@@ -549,7 +699,7 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
       // address has earned by proving it is the real logger, before the
       // sweep moves on and that chance is gone for this pass.
       for (uint8_t attempt = 1; attempt <= 3; attempt++) {
-        if (read_registers(REG_BATCH2_START, 1, probe)) {
+        if (read_registers(REG_DEVICE_TYPE, 1, probe)) {
           ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
           clear_error();
           save_host();
@@ -1185,11 +1335,6 @@ bool SolarmanMinimal::parse_v5_response(const std::vector<uint8_t> &resp, uint8_
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
-
-void SolarmanMinimal::publish_signed(sensor::Sensor *s, uint16_t raw) {
-  if (s)
-    s->publish_state((float) (int16_t) raw);
-}
 
 uint16_t SolarmanMinimal::crc16(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;

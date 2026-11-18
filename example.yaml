@@ -14,7 +14,7 @@ esp32:
 
 external_components:
   # In your own config, use the published tag instead:
-  #   - source: github://xolarkodak/esphome-solarman@v0.6.0
+  #   - source: github://xolarkodak/esphome-solarman@v0.7.0
   #     components: [solarman_minimal]
   - source:
       type: local
@@ -47,7 +47,8 @@ ota:
 solarman_minimal:
   id: solarman
   update_interval: 30s
-  battery_nominal_voltage: 51.2V   # only used for battery_capacity_energy
+  model: auto                      # or single_phase_lv / three_phase_lv / three_phase_hv
+  battery_nominal_voltage: 51.2V   # only used for the kWh figures
 
   battery_soc:
     name: "Battery SOC"
@@ -75,6 +76,10 @@ solarman_minimal:
     name: "Battery capacity"
   battery_capacity_energy:
     name: "Battery capacity kWh"
+  battery_remaining_energy:
+    name: "Battery energy left"
+  device_type:
+    name: "Device type"
   grid_power:
     name: "Grid power"
   load_power:

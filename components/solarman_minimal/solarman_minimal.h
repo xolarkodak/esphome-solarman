@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cmath>
 
 namespace esphome {
 namespace solarman_minimal {
@@ -166,34 +167,95 @@ class SolarmanMinimal : public PollingComponent {
   }
   std::string host_str() const;
 
-  // ── Sensors ──────────────────────────────────────────────────────────────
-  // PV strings 1..4 (index 0..3). One setter each so codegen stays a flat table.
-  void set_pv_power_sensor(uint8_t n, sensor::Sensor *s)   { pv_power_sensors_[n] = s; }
-  void set_pv_voltage_sensor(uint8_t n, sensor::Sensor *s) { pv_voltage_sensors_[n] = s; }
-  void set_pv_current_sensor(uint8_t n, sensor::Sensor *s) { pv_current_sensors_[n] = s; }
-  void set_pv_total_power_sensor(sensor::Sensor *s)   { pv_power_ = s; }
-  void set_grid_voltage_sensor(sensor::Sensor *s)     { grid_voltage_ = s; }
-  void set_grid_frequency_sensor(sensor::Sensor *s)   { grid_frequency_ = s; }
-  void set_battery_current_sensor(sensor::Sensor *s)  { battery_current_ = s; }
-  void set_battery_temperature_sensor(sensor::Sensor *s) { battery_temperature_ = s; }
-  void set_battery_capacity_sensor(sensor::Sensor *s) { battery_capacity_ = s; }
+  // ── Register model ───────────────────────────────────────────────────────
+  //
+  // Every sensor is a Binding: the entity plus one register definition per
+  // model family. Codegen fills these from the profile tables in __init__.py,
+  // so supporting another Deye family means adding a column there, not
+  // touching C++.
+  enum Model : int8_t {
+    MODEL_AUTO = -1,
+    MODEL_SINGLE_PHASE_LV = 0,  // SUN-xK-SG0xLP1, ha-solarman deye_hybrid
+    MODEL_THREE_PHASE_LV = 1,   // SUN-xK-SG0xLP3, ha-solarman deye_p3
+    MODEL_THREE_PHASE_HV = 2,   // SUN-xK-SG0xHP3
+  };
+  static const uint8_t NUM_MODELS = 3;
+
+  enum RegType : uint8_t {
+    TYPE_U16 = 0,
+    TYPE_S16 = 1,
+    TYPE_U32 = 2,     // two registers, LOW word first (Deye's order)
+    TYPE_S32 = 3,
+    TYPE_U32_BE = 4,  // two registers, HIGH word first
+    TYPE_S32_BE = 5,
+  };
+  enum RegFlags : uint8_t {
+    FLAG_SLOW = 1,         // a setting, not a measurement: refresh rarely
+    FLAG_ZERO_IS_NAN = 2,  // raw 0 means "no sensor", publish NaN
+    FLAG_BOOL = 4,         // publish 1 for any non-zero raw value, else 0
+  };
+  // What a binding also feeds, besides its own entity (if it has one).
+  enum Role : uint8_t {
+    ROLE_NONE = 0,
+    ROLE_PV_SUM = 1,       // summed into pv_power
+    ROLE_CAPACITY_AH = 2,  // battery capacity for the kWh figures
+    ROLE_SOC = 3,          // state of charge for battery_remaining_energy
+  };
+
+  struct RegDef {
+    uint16_t reg{0};
+    uint8_t type{TYPE_U16};
+    uint8_t flags{0};
+    float scale{1.0f};
+    float offset{0.0f};
+  };
+  struct Binding {
+    sensor::Sensor *entity{nullptr};  // nullptr = internal input for a derived value
+    uint8_t role{ROLE_NONE};
+    bool has[NUM_MODELS]{false, false, false};
+    RegDef def[NUM_MODELS];
+    float last{NAN};
+  };
+  struct Block {
+    uint16_t start{0};
+    uint8_t count{0};
+    bool slow{false};
+    bool fresh{false};          // read successfully in the current poll
+    uint32_t last_ok_poll{0};   // 0 = never
+    std::vector<uint16_t> data;
+  };
+
+  // Codegen API. Bindings are created in order; Python tracks the index.
+  void add_binding(sensor::Sensor *s, uint8_t role) {
+    Binding b;
+    b.entity = s;
+    b.role = role;
+    bindings_.push_back(b);
+  }
+  void set_register(uint16_t index, uint8_t model, uint16_t reg, uint8_t type, float scale,
+                    float offset, uint8_t flags) {
+    if (index >= bindings_.size() || model >= NUM_MODELS)
+      return;
+    Binding &b = bindings_[index];
+    b.has[model] = true;
+    b.def[model].reg = reg;
+    b.def[model].type = type;
+    b.def[model].scale = scale;
+    b.def[model].offset = offset;
+    b.def[model].flags = flags;
+  }
+  void set_model(int8_t m) { model_cfg_ = m; }
+  void set_max_block_size(uint8_t n) { max_block_size_ = n; }
+  void set_battery_nominal_voltage(float v) { battery_nominal_voltage_ = v; }
+  // Derived sensors, computed from other registers rather than read.
+  void set_pv_total_power_sensor(sensor::Sensor *s) { pv_power_ = s; }
   void set_battery_capacity_energy_sensor(sensor::Sensor *s) { battery_capacity_energy_ = s; }
-  void set_battery_nominal_voltage(float v)           { battery_nominal_voltage_ = v; }
-  void set_battery_soc_sensor(sensor::Sensor *s)      { battery_soc_ = s; }
-  void set_battery_voltage_sensor(sensor::Sensor *s)  { battery_voltage_ = s; }
-  void set_battery_power_sensor(sensor::Sensor *s)    { battery_power_ = s; }
-  void set_grid_power_sensor(sensor::Sensor *s)       { grid_power_ = s; }
-  void set_load_power_sensor(sensor::Sensor *s)       { load_power_ = s; }
-  void set_daily_production_sensor(sensor::Sensor *s) { daily_production_ = s; }
-  void set_total_production_sensor(sensor::Sensor *s) { total_production_ = s; }
-  void set_daily_consumption_sensor(sensor::Sensor *s)       { daily_consumption_ = s; }
-  void set_total_consumption_sensor(sensor::Sensor *s)       { total_consumption_ = s; }
-  void set_daily_energy_bought_sensor(sensor::Sensor *s)     { daily_energy_bought_ = s; }
-  void set_daily_energy_sold_sensor(sensor::Sensor *s)       { daily_energy_sold_ = s; }
-  void set_daily_battery_charge_sensor(sensor::Sensor *s)    { daily_battery_charge_ = s; }
-  void set_daily_battery_discharge_sensor(sensor::Sensor *s) { daily_battery_discharge_ = s; }
-  void set_device_state_sensor(sensor::Sensor *s)            { device_state_ = s; }
-  void set_grid_connected_sensor(sensor::Sensor *s)          { grid_connected_ = s; }
+  void set_battery_remaining_energy_sensor(sensor::Sensor *s) { battery_remaining_energy_ = s; }
+  void set_device_type_sensor(sensor::Sensor *s) { device_type_sensor_ = s; }
+
+  // For the screen: which map is in use, and the raw device type behind it.
+  const char *model_name() const;
+  uint16_t device_type() const { return device_type_raw_; }
 
   // What the component is actually talking to, for the screen. Without this
   // a failing site gives you nothing to go on: the panel says "unreachable"
@@ -279,32 +341,33 @@ class SolarmanMinimal : public PollingComponent {
   ESPPreferenceObject prefs_;
   ESPPreferenceObject serial_prefs_;
 
-  sensor::Sensor *pv_power_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
-  sensor::Sensor *pv_voltage_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
-  sensor::Sensor *pv_current_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
+  std::vector<Binding> bindings_;
+  std::vector<Block> blocks_;
+  int8_t model_cfg_{MODEL_AUTO};  // from YAML
+  int8_t model_{MODEL_AUTO};      // in use; AUTO until the first poll
+  bool model_detected_{false};
+  uint32_t detected_serial_{0};
+  uint32_t detect_attempt_poll_{0};
+  uint16_t device_type_raw_{0};
+  uint8_t max_block_size_{100};
+  uint32_t poll_count_{0};
+  bool round_active_{false};
+  bool round_any_ok_{false};
+  size_t round_next_{0};
+
   sensor::Sensor *pv_power_{nullptr};  // sum of PV1..PV4
-  sensor::Sensor *grid_voltage_{nullptr};
-  sensor::Sensor *grid_frequency_{nullptr};
-  sensor::Sensor *battery_current_{nullptr};
-  sensor::Sensor *battery_temperature_{nullptr};
-  sensor::Sensor *battery_capacity_{nullptr};
   sensor::Sensor *battery_capacity_energy_{nullptr};
+  sensor::Sensor *battery_remaining_energy_{nullptr};
+  sensor::Sensor *device_type_sensor_{nullptr};
   float battery_nominal_voltage_{51.2f};
-  sensor::Sensor *battery_soc_{nullptr};
-  sensor::Sensor *battery_voltage_{nullptr};
-  sensor::Sensor *battery_power_{nullptr};
-  sensor::Sensor *grid_power_{nullptr};
-  sensor::Sensor *load_power_{nullptr};
-  sensor::Sensor *daily_production_{nullptr};
-  sensor::Sensor *total_production_{nullptr};
-  sensor::Sensor *daily_consumption_{nullptr};
-  sensor::Sensor *total_consumption_{nullptr};
-  sensor::Sensor *daily_energy_bought_{nullptr};
-  sensor::Sensor *daily_energy_sold_{nullptr};
-  sensor::Sensor *daily_battery_charge_{nullptr};
-  sensor::Sensor *daily_battery_discharge_{nullptr};
-  sensor::Sensor *device_state_{nullptr};
-  sensor::Sensor *grid_connected_{nullptr};
+
+  bool select_model();
+  void plan_blocks();
+  void round_step();
+  void publish_round();
+  void note_failure();
+  bool lookup(uint16_t reg, uint16_t &out) const;
+  bool decode(const RegDef &d, float &value) const;
 
   bool has_host() const { return host_addr_ != 0; }
   void save_host();
@@ -326,7 +389,6 @@ class SolarmanMinimal : public PollingComponent {
   // returns false. Without it the only evidence of the dongle's identity is
   // discarded on the way out.
   std::vector<uint8_t> last_reply_;
-  void publish_signed(sensor::Sensor *s, uint16_t raw);
   uint16_t crc16(const uint8_t *data, size_t len);
 };
 
