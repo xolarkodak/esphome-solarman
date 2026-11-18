@@ -4,11 +4,18 @@ from esphome.components import sensor
 from esphome.const import (
     CONF_ID,
     DEVICE_CLASS_BATTERY,
+    DEVICE_CLASS_CURRENT,
     DEVICE_CLASS_ENERGY,
+    DEVICE_CLASS_ENERGY_STORAGE,
+    DEVICE_CLASS_FREQUENCY,
     DEVICE_CLASS_POWER,
+    DEVICE_CLASS_TEMPERATURE,
     DEVICE_CLASS_VOLTAGE,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
+    UNIT_AMPERE,
+    UNIT_CELSIUS,
+    UNIT_HERTZ,
     UNIT_KILOWATT_HOURS,
     UNIT_PERCENT,
     UNIT_VOLT,
@@ -25,31 +32,43 @@ AUTO_LOAD = ["sensor"]
 solarman_minimal_ns = cg.esphome_ns.namespace("solarman_minimal")
 SolarmanMinimal = solarman_minimal_ns.class_("SolarmanMinimal", cg.PollingComponent)
 
-CONF_HOST             = "host"
-CONF_TCP_SCAN         = "tcp_scan"
-CONF_SERIAL           = "serial"
-CONF_PV1_POWER        = "pv1_power"
-CONF_PV1_VOLTAGE      = "pv1_voltage"
-CONF_PV2_POWER        = "pv2_power"
-CONF_PV2_VOLTAGE      = "pv2_voltage"
-CONF_BATTERY_SOC      = "battery_soc"
-CONF_BATTERY_VOLTAGE  = "battery_voltage"
-CONF_BATTERY_POWER    = "battery_power"
-CONF_GRID_POWER       = "grid_power"
-CONF_LOAD_POWER       = "load_power"
-CONF_DAILY_PRODUCTION = "daily_production"
-CONF_TOTAL_PRODUCTION = "total_production"
-CONF_DAILY_CONSUMPTION = "daily_consumption"
-CONF_TOTAL_CONSUMPTION = "total_consumption"
-CONF_DAILY_ENERGY_BOUGHT = "daily_energy_bought"
-CONF_DAILY_ENERGY_SOLD = "daily_energy_sold"
-CONF_DAILY_BATTERY_CHARGE = "daily_battery_charge"
-CONF_DAILY_BATTERY_DISCHARGE = "daily_battery_discharge"
-CONF_DEVICE_STATE = "device_state"
-CONF_GRID_CONNECTED = "grid_connected"
+CONF_HOST = "host"
+CONF_TCP_SCAN = "tcp_scan"
+CONF_SERIAL = "serial"
+CONF_BATTERY_NOMINAL_VOLTAGE = "battery_nominal_voltage"
+
+UNIT_AMPERE_HOURS = "Ah"
 
 
-def _energy_schema():
+# ── Sensor shapes ──────────────────────────────────────────────────────────
+def _power():
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_WATT,
+        accuracy_decimals=0,
+        device_class=DEVICE_CLASS_POWER,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _voltage(decimals=1):
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_VOLT,
+        accuracy_decimals=decimals,
+        device_class=DEVICE_CLASS_VOLTAGE,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _current(decimals=1):
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_AMPERE,
+        accuracy_decimals=decimals,
+        device_class=DEVICE_CLASS_CURRENT,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+def _energy():
     """Every daily/total counter on this inverter is the same shape: kWh at one
     decimal, monotonic within its period."""
     return sensor.sensor_schema(
@@ -59,6 +78,125 @@ def _energy_schema():
         state_class=STATE_CLASS_TOTAL_INCREASING,
     )
 
+
+def _plain():
+    return sensor.sensor_schema(
+        accuracy_decimals=0,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+
+
+# key -> (schema factory, C++ setter, extra positional args before the sensor)
+#
+# Kept as one table so the schema and the codegen cannot drift apart: a key
+# that validates but is never wired to C++ would produce an entity that stays
+# "unknown" forever, with nothing in the log to say why.
+SENSORS = {
+    # ── PV strings. PVn power 0x00BA+(n-1), voltage 0x006D+2(n-1),
+    #    current 0x006E+2(n-1). PV3/PV4 read 0 on 2-MPPT models.
+    **{
+        f"pv{n}_power": (_power, "set_pv_power_sensor", [n - 1])
+        for n in range(1, 5)
+    },
+    **{
+        f"pv{n}_voltage": (_voltage, "set_pv_voltage_sensor", [n - 1])
+        for n in range(1, 5)
+    },
+    **{
+        f"pv{n}_current": (_current, "set_pv_current_sensor", [n - 1])
+        for n in range(1, 5)
+    },
+    # Sum of PV1..PV4, computed here so a screen does not need a template.
+    "pv_power": (_power, "set_pv_total_power_sensor", []),
+    # ── Grid (inverter AC input)
+    # 0x0096, grid-side L1-N voltage x0.1 V.
+    "grid_voltage": (_voltage, "set_grid_voltage_sensor", []),
+    # 0x004F, x0.01 Hz.
+    "grid_frequency": (
+        lambda: sensor.sensor_schema(
+            unit_of_measurement=UNIT_HERTZ,
+            accuracy_decimals=2,
+            device_class=DEVICE_CLASS_FREQUENCY,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        "set_grid_frequency_sensor",
+        [],
+    ),
+    # Signed, but the direction convention is NOT yet confirmed — it read
+    # 0 W throughout the only upstream field test. Verify against a known
+    # reference during grid import or export before trusting the sign.
+    "grid_power": (_power, "set_grid_power_sensor", []),
+    # 1 = tied to the utility, 0 = islanded. Numeric rather than a
+    # binary_sensor so this component keeps a single entity type.
+    "grid_connected": (_plain, "set_grid_connected_sensor", []),
+    "load_power": (_power, "set_load_power_sensor", []),
+    # ── Battery
+    "battery_soc": (
+        lambda: sensor.sensor_schema(
+            unit_of_measurement=UNIT_PERCENT,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_BATTERY,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        "set_battery_soc_sensor",
+        [],
+    ),
+    "battery_voltage": (lambda: _voltage(2), "set_battery_voltage_sensor", []),
+    # Signed. Positive = DISCHARGING, confirmed on a Deye 8K SG05LP1:
+    # with PV at 2 W, grid at 0 W and load at 2705 W the register read
+    # +2813 W, so a positive value is power leaving the battery.
+    "battery_power": (_power, "set_battery_power_sensor", []),
+    # 0x00BF, x0.01 A, same sign as battery_power.
+    "battery_current": (lambda: _current(1), "set_battery_current_sensor", []),
+    # 0x00B6, x0.1 C with a +100 C offset; NaN when no probe / BMS.
+    "battery_temperature": (
+        lambda: sensor.sensor_schema(
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
+            device_class=DEVICE_CLASS_TEMPERATURE,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        "set_battery_temperature_sensor",
+        [],
+    ),
+    # 0x00CC: battery capacity as configured on the inverter (Battery Setting
+    # -> Batt Capacity), in Ah.
+    "battery_capacity": (
+        lambda: sensor.sensor_schema(
+            unit_of_measurement=UNIT_AMPERE_HOURS,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            icon="mdi:battery-high",
+        ),
+        "set_battery_capacity_sensor",
+        [],
+    ),
+    # Same capacity in kWh: Ah x battery_nominal_voltage / 1000.
+    "battery_capacity_energy": (
+        lambda: sensor.sensor_schema(
+            unit_of_measurement=UNIT_KILOWATT_HOURS,
+            accuracy_decimals=2,
+            device_class=DEVICE_CLASS_ENERGY_STORAGE,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        "set_battery_capacity_energy_sensor",
+        [],
+    ),
+    # ── Energy counters
+    "daily_production": (_energy, "set_daily_production_sensor", []),
+    "total_production": (_energy, "set_total_production_sensor", []),
+    "daily_consumption": (_energy, "set_daily_consumption_sensor", []),
+    "total_consumption": (_energy, "set_total_consumption_sensor", []),
+    "daily_energy_bought": (_energy, "set_daily_energy_bought_sensor", []),
+    "daily_energy_sold": (_energy, "set_daily_energy_sold_sensor", []),
+    "daily_battery_charge": (_energy, "set_daily_battery_charge_sensor", []),
+    "daily_battery_discharge": (_energy, "set_daily_battery_discharge_sensor", []),
+    # ── State
+    # Enum from register 0x003B: 0 standby, 1 self-test, 2 normal,
+    # 3 alarm, 4 fault. Published raw; label it where it is displayed.
+    "device_state": (_plain, "set_device_state_sensor", []),
+}
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SolarmanMinimal),
@@ -66,104 +204,19 @@ CONFIG_SCHEMA = cv.Schema(
         # Can be omitted if set at runtime via the "Logger Serial" text entity + web_server.
         cv.Optional(CONF_SERIAL, default=0): cv.uint32_t,
         # Optional: skip UDP discovery and use a fixed IP
-        cv.Optional(CONF_HOST): cv.string,
-        # Sweep the local /24 for an open port 8899 when UDP discovery finds
-        # nothing. Off by default: it is a scan of someone else's network and
-        # should be a deliberate choice, not a surprise. Five dongles across
-        # four sites never answered a UDP probe while all of them served 8899,
-        # so on those this is the only discovery with a chance of working.
+        cv.Optional(CONF_HOST): cv.ipv4address,
+        # Allow the on-demand /24 sweep for an open port 8899 (start_scan()).
+        # Off by default: it is a scan of someone else's network and should be
+        # a deliberate choice, not a surprise. Five dongles across four sites
+        # never answered a UDP probe while all of them served 8899, so on those
+        # this is the only discovery with a chance of working.
         cv.Optional(CONF_TCP_SCAN, default=False): cv.boolean,
-
-        cv.Optional(CONF_PV1_POWER): sensor.sensor_schema(
-            unit_of_measurement=UNIT_WATT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_POWER,
-            state_class=STATE_CLASS_MEASUREMENT,
+        # Used only for battery_capacity_energy. 51.2 V = a 16-cell LiFePO4
+        # bank, which is what nearly every 48 V Deye installation runs.
+        cv.Optional(CONF_BATTERY_NOMINAL_VOLTAGE, default=51.2): cv.All(
+            cv.voltage, cv.float_range(min=1.0, max=1000.0)
         ),
-        cv.Optional(CONF_PV1_VOLTAGE): sensor.sensor_schema(
-            unit_of_measurement=UNIT_VOLT,
-            accuracy_decimals=1,
-            device_class=DEVICE_CLASS_VOLTAGE,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_PV2_POWER): sensor.sensor_schema(
-            unit_of_measurement=UNIT_WATT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_POWER,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_PV2_VOLTAGE): sensor.sensor_schema(
-            unit_of_measurement=UNIT_VOLT,
-            accuracy_decimals=1,
-            device_class=DEVICE_CLASS_VOLTAGE,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_BATTERY_SOC): sensor.sensor_schema(
-            unit_of_measurement=UNIT_PERCENT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_BATTERY,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_BATTERY_VOLTAGE): sensor.sensor_schema(
-            unit_of_measurement=UNIT_VOLT,
-            accuracy_decimals=1,
-            device_class=DEVICE_CLASS_VOLTAGE,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        # Signed. Positive = DISCHARGING, confirmed on a Deye 8K SG05LP1:
-        # with PV at 2 W, grid at 0 W and load at 2705 W the register read
-        # +2813 W, so a positive value is power leaving the battery.
-        cv.Optional(CONF_BATTERY_POWER): sensor.sensor_schema(
-            unit_of_measurement=UNIT_WATT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_POWER,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        # Signed, but the direction convention is NOT yet confirmed — it read
-        # 0 W throughout the only field test so far. Verify against a known
-        # reference during grid import or export before trusting the sign.
-        cv.Optional(CONF_GRID_POWER): sensor.sensor_schema(
-            unit_of_measurement=UNIT_WATT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_POWER,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_LOAD_POWER): sensor.sensor_schema(
-            unit_of_measurement=UNIT_WATT,
-            accuracy_decimals=0,
-            device_class=DEVICE_CLASS_POWER,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        cv.Optional(CONF_DAILY_PRODUCTION): sensor.sensor_schema(
-            unit_of_measurement=UNIT_KILOWATT_HOURS,
-            accuracy_decimals=1,
-            device_class=DEVICE_CLASS_ENERGY,
-            state_class=STATE_CLASS_TOTAL_INCREASING,
-        ),
-        cv.Optional(CONF_TOTAL_PRODUCTION): sensor.sensor_schema(
-            unit_of_measurement=UNIT_KILOWATT_HOURS,
-            accuracy_decimals=1,
-            device_class=DEVICE_CLASS_ENERGY,
-            state_class=STATE_CLASS_TOTAL_INCREASING,
-        ),
-        cv.Optional(CONF_DAILY_CONSUMPTION): _energy_schema(),
-        cv.Optional(CONF_TOTAL_CONSUMPTION): _energy_schema(),
-        cv.Optional(CONF_DAILY_ENERGY_BOUGHT): _energy_schema(),
-        cv.Optional(CONF_DAILY_ENERGY_SOLD): _energy_schema(),
-        cv.Optional(CONF_DAILY_BATTERY_CHARGE): _energy_schema(),
-        cv.Optional(CONF_DAILY_BATTERY_DISCHARGE): _energy_schema(),
-        # Enum from register 0x003B: 0 standby, 1 self-test, 2 normal,
-        # 3 alarm, 4 fault. Published raw; label it where it is displayed.
-        cv.Optional(CONF_DEVICE_STATE): sensor.sensor_schema(
-            accuracy_decimals=0,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
-        # 1 = tied to the utility, 0 = islanded. Numeric rather than a
-        # binary_sensor so this component keeps a single entity type.
-        cv.Optional(CONF_GRID_CONNECTED): sensor.sensor_schema(
-            accuracy_decimals=0,
-            state_class=STATE_CLASS_MEASUREMENT,
-        ),
+        **{cv.Optional(key): factory() for key, (factory, _, _) in SENSORS.items()},
     }
 ).extend(cv.polling_component_schema("30s"))
 
@@ -174,31 +227,11 @@ async def to_code(config):
 
     cg.add(var.set_serial(config[CONF_SERIAL]))  # 0 = load from flash
     cg.add(var.set_tcp_scan(config[CONF_TCP_SCAN]))
+    cg.add(var.set_battery_nominal_voltage(config[CONF_BATTERY_NOMINAL_VOLTAGE]))
     if CONF_HOST in config:
-        cg.add(var.set_host(config[CONF_HOST]))
+        cg.add(var.set_host(str(config[CONF_HOST])))
 
-    sensor_map = [
-        (CONF_PV1_POWER,        "set_pv1_power_sensor"),
-        (CONF_PV1_VOLTAGE,      "set_pv1_voltage_sensor"),
-        (CONF_PV2_POWER,        "set_pv2_power_sensor"),
-        (CONF_PV2_VOLTAGE,      "set_pv2_voltage_sensor"),
-        (CONF_BATTERY_SOC,      "set_battery_soc_sensor"),
-        (CONF_BATTERY_VOLTAGE,  "set_battery_voltage_sensor"),
-        (CONF_BATTERY_POWER,    "set_battery_power_sensor"),
-        (CONF_GRID_POWER,       "set_grid_power_sensor"),
-        (CONF_LOAD_POWER,       "set_load_power_sensor"),
-        (CONF_DAILY_PRODUCTION, "set_daily_production_sensor"),
-        (CONF_TOTAL_PRODUCTION, "set_total_production_sensor"),
-        (CONF_DAILY_CONSUMPTION, "set_daily_consumption_sensor"),
-        (CONF_TOTAL_CONSUMPTION, "set_total_consumption_sensor"),
-        (CONF_DAILY_ENERGY_BOUGHT, "set_daily_energy_bought_sensor"),
-        (CONF_DAILY_ENERGY_SOLD, "set_daily_energy_sold_sensor"),
-        (CONF_DAILY_BATTERY_CHARGE, "set_daily_battery_charge_sensor"),
-        (CONF_DAILY_BATTERY_DISCHARGE, "set_daily_battery_discharge_sensor"),
-        (CONF_DEVICE_STATE, "set_device_state_sensor"),
-        (CONF_GRID_CONNECTED, "set_grid_connected_sensor"),
-    ]
-    for conf_key, setter in sensor_map:
-        if conf_key in config:
-            sens = await sensor.new_sensor(config[conf_key])
-            cg.add(getattr(var, setter)(sens))
+    for key, (_, setter, args) in SENSORS.items():
+        if key in config:
+            sens = await sensor.new_sensor(config[key])
+            cg.add(getattr(var, setter)(*args, sens))

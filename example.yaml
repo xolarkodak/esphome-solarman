@@ -14,7 +14,7 @@ esp32:
 
 external_components:
   # In your own config, use the published tag instead:
-  #   - source: github://zerogrid-srl/esphome-solarman@v0.1.0
+  #   - source: github://xolarkodak/esphome-solarman@v0.6.0
   #     components: [solarman_minimal]
   - source:
       type: local
@@ -47,6 +47,7 @@ ota:
 solarman_minimal:
   id: solarman
   update_interval: 30s
+  battery_nominal_voltage: 51.2V   # only used for battery_capacity_energy
 
   battery_soc:
     name: "Battery SOC"
@@ -58,6 +59,22 @@ solarman_minimal:
     name: "PV1 power"
   pv2_power:
     name: "PV2 power"
+  pv3_power:
+    name: "PV3 power"
+  pv3_voltage:
+    name: "PV3 voltage"
+  pv3_current:
+    name: "PV3 current"
+  pv_power:
+    name: "PV total power"
+  grid_voltage:
+    name: "Grid voltage"
+  grid_frequency:
+    name: "Grid frequency"
+  battery_capacity:
+    name: "Battery capacity"
+  battery_capacity_energy:
+    name: "Battery capacity kWh"
   grid_power:
     name: "Grid power"
   load_power:

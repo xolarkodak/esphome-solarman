@@ -17,6 +17,8 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 
 namespace esphome {
 namespace solarman_minimal {
@@ -34,7 +36,8 @@ static const char *const TAG = "solarman";
 // hardware — long enough for ESPHome to warn, and long enough to disturb a BLE
 // stack sharing the same device.
 //
-// Batch 1  0x003B..0x006F  (53 regs) - state, daily counters, energy totals
+// Batch 1  as first field-confirmed: 0x003B..0x006F (53 regs) - state, daily
+//          counters, energy totals. Index [i] = 0x003B + i. Now wider, see below.
 //   [ 0]      0x003B = Device State, enum: 0 standby, 1 self-test, 2 normal,
 //                      3 alarm, 4 fault
 //   [11]      0x0046 = Daily Battery Charge    x0.1 kWh
@@ -50,7 +53,8 @@ static const char *const TAG = "solarman";
 //   [50]      0x006D = PV1 Voltage      x0.1 V
 //   [52]      0x006F = PV2 Voltage      x0.1 V
 //
-// Batch 2  0x00A9..0x00C2  (26 regs)
+// Batch 2  as first field-confirmed: 0x00A9..0x00C2 (26 regs). Index [i] =
+//          0x00A9 + i. Now starts lower, see below.
 //   [0]  0x00A9 = Grid Power      W  signed
 //   [9]  0x00B2 = Load Power      W  signed
 //   [14] 0x00B7 = Battery Voltage ×0.01 V
@@ -81,10 +85,59 @@ static const char *const TAG = "solarman";
 // either — the profile marks the sensor `attributes: [inverse]` while the
 // parser tests a differently-named key, `inverted`. To be settled by comparing
 // against a working integration during grid import or export.
+//
+// Extended (fork, 2026-11): both batches widened once more instead of adding a
+// third connection, for the same reason as above.
+//   Batch 1 now runs to 0x0074 to pick up PV1-PV4 current and PV3/PV4 voltage
+//   (Deye Modbus map: 109..116 = DC voltage/current 1..4, x0.1).
+//   Batch 2 now starts at 0x0096 (grid-side voltage L1-N, x0.1 V) and runs to
+//   0x00CC (configured battery capacity, Ah). 0x0096..0x00F8 is the range the
+//   ha-solarman deye_hybrid profile reads in ONE request, so the logger is known
+//   to accept a frame this size.
+//
+// Every value is now looked up by its register address rather than by an index
+// into the batch, so widening a batch can never silently shift a sensor onto
+// the wrong register again.
 static const uint16_t REG_BATCH1_START = 0x003B;
-static const uint8_t  REG_BATCH1_COUNT = 53;  // through 0x006F
-static const uint16_t REG_BATCH2_START = 0x00A9;
-static const uint8_t  REG_BATCH2_COUNT = 26;  // through 0x00C2
+static const uint8_t  REG_BATCH1_COUNT = 58;  // through 0x0074
+static const uint16_t REG_BATCH2_START = 0x0096;
+static const uint8_t  REG_BATCH2_COUNT = 55;  // through 0x00CC
+
+// Batch 1
+static const uint16_t REG_DEVICE_STATE        = 0x003B;
+static const uint16_t REG_DAILY_BATT_CHARGE   = 0x0046;
+static const uint16_t REG_DAILY_BATT_DISCHG   = 0x0047;
+static const uint16_t REG_DAILY_BOUGHT        = 0x004C;
+static const uint16_t REG_DAILY_SOLD          = 0x004D;
+static const uint16_t REG_GRID_FREQUENCY      = 0x004F;  // x0.01 Hz
+static const uint16_t REG_DAILY_LOAD          = 0x0054;
+static const uint16_t REG_TOTAL_LOAD_LO       = 0x0055;  // + 0x0056 high word
+static const uint16_t REG_TOTAL_PRODUCTION_LO = 0x0060;  // + 0x0061 high word
+static const uint16_t REG_DAILY_PRODUCTION    = 0x006C;
+static const uint16_t REG_PV1_VOLTAGE         = 0x006D;  // PVn voltage = 0x006D + 2(n-1)
+static const uint16_t REG_PV1_CURRENT         = 0x006E;  // PVn current = 0x006E + 2(n-1)
+// Batch 2
+static const uint16_t REG_GRID_VOLTAGE        = 0x0096;  // x0.1 V, grid side L1-N
+static const uint16_t REG_GRID_POWER          = 0x00A9;
+static const uint16_t REG_LOAD_POWER          = 0x00B2;
+static const uint16_t REG_BATTERY_TEMP        = 0x00B6;  // x0.1 C, offset +100 C
+static const uint16_t REG_BATTERY_VOLTAGE     = 0x00B7;
+static const uint16_t REG_BATTERY_SOC         = 0x00B8;
+static const uint16_t REG_PV1_POWER           = 0x00BA;  // PVn power = 0x00BA + (n-1)
+static const uint16_t REG_BATTERY_POWER       = 0x00BE;
+static const uint16_t REG_BATTERY_CURRENT     = 0x00BF;  // x0.01 A signed
+static const uint16_t REG_GRID_CONNECTED      = 0x00C2;
+static const uint16_t REG_BATTERY_CAPACITY    = 0x00CC;  // Ah, as set on the inverter
+
+// Register `addr` out of a batch that starts at `start`. The batch length is
+// guaranteed by read_registers(), and the constants above are all in range.
+static inline uint16_t at(const std::vector<uint16_t> &b, uint16_t start, uint16_t addr) {
+  return b[addr - start];
+}
+
+// millis() wraps after ~49.7 days, and a screen on the wall runs that long.
+// `millis() < deadline` breaks at the wrap; a signed difference does not.
+static inline bool before(uint32_t deadline) { return (int32_t) (millis() - deadline) < 0; }
 
 // Fixed NVS key for the serial preference (independent of the serial value)
 static const uint32_t SERIAL_PREFS_KEY = 0x534C4D41;  // "SLMA"
@@ -278,37 +331,64 @@ void SolarmanMinimal::update() {
   }
   consecutive_failures_ = 0;
   clear_error();
-  if (grid_power_)      publish_signed(grid_power_, b2[0]);
-  if (load_power_)      publish_signed(load_power_, b2[9]);
-  if (battery_voltage_) battery_voltage_->publish_state(b2[14] * 0.01f);
-  if (battery_soc_)     battery_soc_->publish_state(b2[15]);
-  if (pv1_power_)       pv1_power_->publish_state(b2[17]);
-  if (pv2_power_)       pv2_power_->publish_state(b2[18]);
-  if (battery_power_)   publish_signed(battery_power_, b2[21]);
+  auto r2 = [&](uint16_t addr) { return at(b2, REG_BATCH2_START, addr); };
+
+  if (grid_voltage_)    grid_voltage_->publish_state(r2(REG_GRID_VOLTAGE) * 0.1f);
+  if (grid_power_)      publish_signed(grid_power_, r2(REG_GRID_POWER));
+  if (load_power_)      publish_signed(load_power_, r2(REG_LOAD_POWER));
+  if (battery_voltage_) battery_voltage_->publish_state(r2(REG_BATTERY_VOLTAGE) * 0.01f);
+  if (battery_soc_)     battery_soc_->publish_state(r2(REG_BATTERY_SOC));
+  if (battery_power_)   publish_signed(battery_power_, r2(REG_BATTERY_POWER));
+  // Same sign as battery_power: positive = discharging.
+  if (battery_current_)
+    battery_current_->publish_state((int16_t) r2(REG_BATTERY_CURRENT) * 0.01f);
+  // Stored with a +100 C offset so sub-zero readings stay unsigned: 1000 = 0 C.
+  // 0 means "no sensor" (lead-acid without a probe, BMS not talking) - publish
+  // NaN rather than a convincing -100 C.
+  if (battery_temperature_) {
+    uint16_t raw = r2(REG_BATTERY_TEMP);
+    battery_temperature_->publish_state(raw == 0 ? NAN : raw * 0.1f - 100.0f);
+  }
+  if (battery_capacity_ || battery_capacity_energy_) {
+    uint16_t ah = r2(REG_BATTERY_CAPACITY);
+    if (battery_capacity_) battery_capacity_->publish_state(ah);
+    if (battery_capacity_energy_)
+      battery_capacity_energy_->publish_state(ah * battery_nominal_voltage_ / 1000.0f);
+  }
+
+  float pv_sum = 0;
+  for (uint8_t n = 0; n < 4; n++) {
+    uint16_t w = r2(REG_PV1_POWER + n);
+    pv_sum += w;
+    if (pv_power_sensors_[n]) pv_power_sensors_[n]->publish_state(w);
+  }
+  if (pv_power_) pv_power_->publish_state(pv_sum);
   // Published as 0/1 rather than a binary_sensor: this component builds its own
   // entities, and a numeric sensor keeps every consumer on one code path.
-  if (grid_connected_)  grid_connected_->publish_state(b2[25] != 0 ? 1.0f : 0.0f);
+  if (grid_connected_)  grid_connected_->publish_state(r2(REG_GRID_CONNECTED) != 0 ? 1.0f : 0.0f);
 
-  // ── Batch 1: state, daily counters, energy totals, PV voltages ──────────
+  // ── Batch 1: state, daily counters, energy totals, PV voltage/current ───
   std::vector<uint16_t> b1;
   if (read_registers(REG_BATCH1_START, REG_BATCH1_COUNT, b1)) {
-    if (device_state_) device_state_->publish_state(b1[0]);
-    if (daily_battery_charge_)    daily_battery_charge_->publish_state(b1[11] * 0.1f);
-    if (daily_battery_discharge_) daily_battery_discharge_->publish_state(b1[12] * 0.1f);
-    if (daily_energy_bought_)     daily_energy_bought_->publish_state(b1[17] * 0.1f);
-    if (daily_energy_sold_)       daily_energy_sold_->publish_state(b1[18] * 0.1f);
-    if (daily_consumption_)       daily_consumption_->publish_state(b1[25] * 0.1f);
-    if (total_consumption_) {
-      uint32_t raw = (uint32_t) b1[26] | ((uint32_t) b1[27] << 16);
-      total_consumption_->publish_state(raw * 0.1f);
+    auto r1 = [&](uint16_t addr) { return at(b1, REG_BATCH1_START, addr); };
+    auto r1_u32 = [&](uint16_t lo) { return (uint32_t) r1(lo) | ((uint32_t) r1(lo + 1) << 16); };
+
+    if (device_state_)            device_state_->publish_state(r1(REG_DEVICE_STATE));
+    if (grid_frequency_)          grid_frequency_->publish_state(r1(REG_GRID_FREQUENCY) * 0.01f);
+    if (daily_battery_charge_)    daily_battery_charge_->publish_state(r1(REG_DAILY_BATT_CHARGE) * 0.1f);
+    if (daily_battery_discharge_) daily_battery_discharge_->publish_state(r1(REG_DAILY_BATT_DISCHG) * 0.1f);
+    if (daily_energy_bought_)     daily_energy_bought_->publish_state(r1(REG_DAILY_BOUGHT) * 0.1f);
+    if (daily_energy_sold_)       daily_energy_sold_->publish_state(r1(REG_DAILY_SOLD) * 0.1f);
+    if (daily_consumption_)       daily_consumption_->publish_state(r1(REG_DAILY_LOAD) * 0.1f);
+    if (total_consumption_)       total_consumption_->publish_state(r1_u32(REG_TOTAL_LOAD_LO) * 0.1f);
+    if (total_production_)        total_production_->publish_state(r1_u32(REG_TOTAL_PRODUCTION_LO) * 0.1f);
+    if (daily_production_)        daily_production_->publish_state(r1(REG_DAILY_PRODUCTION) * 0.1f);
+    for (uint8_t n = 0; n < 4; n++) {
+      if (pv_voltage_sensors_[n])
+        pv_voltage_sensors_[n]->publish_state(r1(REG_PV1_VOLTAGE + 2 * n) * 0.1f);
+      if (pv_current_sensors_[n])
+        pv_current_sensors_[n]->publish_state(r1(REG_PV1_CURRENT + 2 * n) * 0.1f);
     }
-    if (total_production_) {
-      uint32_t raw = (uint32_t) b1[37] | ((uint32_t) b1[38] << 16);
-      total_production_->publish_state(raw * 0.1f);
-    }
-    if (daily_production_) daily_production_->publish_state(b1[49] * 0.1f);
-    if (pv1_voltage_)      pv1_voltage_->publish_state(b1[50] * 0.1f);
-    if (pv2_voltage_)      pv2_voltage_->publish_state(b1[52] * 0.1f);
   }
 }
 
@@ -338,10 +418,12 @@ void SolarmanMinimal::scan_registers() {
   // for other Deye variants whose layout differs.
   static const Range ranges[] = {
       {0x003B, 10, "Time / status"},
-      {0x005C, 12, "Energy totals (incl. 0x0060 total production)"},
-      {0x0068, 12, "Daily yield + PV voltage / current"},
-      {0x00A5, 28, "Grid power, load power, battery, PV power"},
-      {0x00C0, 16, "Battery / temperature extras"},
+      {0x0046, 10, "Daily battery / grid counters, grid frequency 0x004F"},
+      {0x0054, 14, "Energy totals (incl. 0x0060 total production)"},
+      {0x0068, 13, "Daily yield + PV1-PV4 voltage / current"},
+      {0x0096, 16, "Grid voltage / current"},
+      {0x00A5, 28, "Grid power, load power, battery, PV1-PV4 power"},
+      {0x00C0, 16, "Battery extras, battery capacity 0x00CC"},
       {0x00E0, 16, "Grid meter"},
       {0x0202, 24, "Alternative layout: energy"},
       {0x0244, 20, "Alternative layout: battery / PV"},
@@ -574,7 +656,7 @@ bool SolarmanMinimal::tcp_scan_step() {
     }
   }
 
-  if (found == 0 && millis() < scan_batch_deadline_)
+  if (found == 0 && before(scan_batch_deadline_))
     return false;  // still waiting on this batch; poll again next pass
 
   for (int i = 0; i < scan_batch_count_; i++)
@@ -697,7 +779,7 @@ bool SolarmanMinimal::discover_host() {
   }
 
   uint32_t deadline = millis() + DISCOVERY_WAIT;
-  while (millis() < deadline) {
+  while (before(deadline)) {
     App.feed_wdt();
 
     // Watch both sockets: the ephemeral one catches a dongle that answers its
@@ -836,7 +918,7 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
   if (rc < 0) {
     bool connected = false;
     uint32_t deadline = millis() + CONNECT_TIMEOUT;
-    while (millis() < deadline) {
+    while (before(deadline)) {
       App.feed_wdt();
       fd_set wfds;
       FD_ZERO(&wfds);
@@ -873,21 +955,61 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
     return false;
   }
 
-  // Minimum expected frame: 11 (header) + 15 (payload overhead)
-  //                       + 1 (byte_count) + count*2 + 2 (checksum + end)
-  const size_t expected = 29 + count * 2;
+  // Read whole V5 frames, sized by their own length field.
+  //
+  // This used to stop at a fixed "29 + 2*count" bytes, which is three bytes
+  // SHORT of a real reply (11 header + 14 payload header + 5 + 2*count Modbus
+  // + 2 trailer = 32 + 2*count). It only worked because the reply usually
+  // arrives in one TCP segment; when it was split near the end, the read
+  // stopped early, the trailing 0x15 was missing and the whole poll failed.
+  //
+  // A logger can also slip an unrelated frame (heartbeat, data push) into the
+  // stream ahead of our answer. Anything that is not a 0x1510 response is
+  // dropped and reading continues until the real one or the deadline.
+  std::vector<uint8_t> buf;
   std::vector<uint8_t> resp;
-  resp.reserve(expected);
+  buf.reserve(64 + count * 2);
 
   uint32_t deadline = millis() + READ_TIMEOUT;
-  while (resp.size() < expected && millis() < deadline) {
+  bool closed = false;
+  while (resp.empty() && before(deadline)) {
+    // Pull out every complete frame already buffered.
+    while (!buf.empty()) {
+      if (buf[0] != 0xA5) {  // resynchronise on the next start byte
+        auto it = std::find(buf.begin() + 1, buf.end(), (uint8_t) 0xA5);
+        buf.erase(buf.begin(), it);
+        continue;
+      }
+      if (buf.size() < 3)
+        break;
+      size_t total = 13 + ((size_t) buf[1] | ((size_t) buf[2] << 8));
+      if (total > 1024) {  // not a plausible length - drop this start byte
+        buf.erase(buf.begin());
+        continue;
+      }
+      if (buf.size() < total)
+        break;
+      std::vector<uint8_t> frame(buf.begin(), buf.begin() + total);
+      buf.erase(buf.begin(), buf.begin() + total);
+      if (frame.size() >= 5 && frame[3] == 0x10 && frame[4] == 0x15) {
+        resp = std::move(frame);
+        break;
+      }
+      ESP_LOGD(TAG, "Skipping unsolicited V5 frame, control 0x%02X%02X (%u bytes)",
+               frame.size() >= 5 ? frame[4] : 0, frame.size() >= 5 ? frame[3] : 0,
+               (unsigned) frame.size());
+      last_reply_ = frame;  // still names the logger if nothing else arrives
+    }
+    if (!resp.empty() || closed)
+      break;
+
     App.feed_wdt();
     uint8_t chunk[128];
     int n = ::recv(fd, chunk, sizeof(chunk), 0);
     if (n > 0) {
-      resp.insert(resp.end(), chunk, chunk + n);
+      buf.insert(buf.end(), chunk, chunk + n);
     } else if (n == 0) {
-      break;  // peer closed
+      closed = true;  // peer closed - still parse what we have
     } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
       ESP_LOGW(TAG, "TCP recv failed: %d", errno);
       break;
@@ -895,15 +1017,19 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
   }
   ::close(fd);
 
-  last_reply_ = resp;
-  if (!parse_v5_response(resp, out)) {
-    note_error("V5", resp.empty() ? 0 : -1);
+  if (resp.empty()) {
+    // Keep the partial bytes too: a reply that was cut short is still evidence
+    // of who answered, and frame_serial() checks the delimiters itself.
+    if (last_reply_.empty())
+      last_reply_ = buf;
+    ESP_LOGW(TAG, "No V5 response for 0x%04X (%u stray bytes)", start, (unsigned) buf.size());
+    note_error("V5", buf.empty() ? 0 : -1);
     return false;
   }
 
-  // Guard the callers' fixed indexes: a short reply must not be treated as valid
-  if (out.size() < count) {
-    ESP_LOGW(TAG, "Short reply for 0x%04X: got %u regs, expected %u", start, (unsigned) out.size(), count);
+  last_reply_ = resp;
+  if (!parse_v5_response(resp, count, out)) {
+    note_error("V5", -1);
     return false;
   }
   return true;
@@ -991,35 +1117,71 @@ uint32_t SolarmanMinimal::frame_serial(const std::vector<uint8_t> &frame) {
          ((uint32_t) frame[9] << 16) | ((uint32_t) frame[10] << 24);
 }
 
-bool SolarmanMinimal::parse_v5_response(const std::vector<uint8_t> &resp, std::vector<uint16_t> &regs) {
-  if (resp.size() < 20) {
-    ESP_LOGW(TAG, "Response too short (%u bytes)", (unsigned) resp.size());
+// Response layout (multi-byte V5 fields little-endian):
+//
+//  [0]      0xA5
+//  [1..2]   payload length
+//  [3..4]   control code 0x1510 (response to our 0x4510)
+//  [5..6]   sequence
+//  [7..10]  logger serial
+//  [11]     frame type (0x02)
+//  [12]     status (0x01 = OK)
+//  [13..24] total working time, power-on time, offset time (3 x uint32)
+//  [25..]   Modbus RTU reply: slave, FC, byte_count, data..., CRC16
+//  [N-2]    checksum, [N-1] 0x15
+//
+// The Modbus reply is taken from its FIXED offset 25. It used to be found by
+// scanning forward from byte 11 for "01 03", which also matches inside the
+// header: the status byte is 0x01, so whenever the low byte of the working-
+// time counter happened to be 0x03 (about one poll in 900, simulated) the timestamps were
+// decoded as register values and published - the occasional absurd spike on
+// the screen. Fixed offset plus a CRC check makes a bad frame a failed poll
+// instead of a wrong number.
+bool SolarmanMinimal::parse_v5_response(const std::vector<uint8_t> &resp, uint8_t count,
+                                        std::vector<uint16_t> &regs) {
+  const size_t MB = 25;
+  if (resp.size() < MB + 5 + 2) {
+    ESP_LOGW(TAG, "Response too short (%u bytes) - logger rejected the request?", (unsigned) resp.size());
     return false;
   }
   if (resp.front() != 0xA5 || resp.back() != 0x15) {
     ESP_LOGW(TAG, "Invalid V5 delimiters (0x%02X .. 0x%02X)", resp.front(), resp.back());
     return false;
   }
-
-  // Scan for the embedded Modbus reply: slave=0x01, FC=0x03, byte_count
-  for (size_t i = 11; i + 4 < resp.size(); i++) {
-    if (resp[i] != 0x01 || resp[i + 1] != 0x03)
-      continue;
-    uint8_t byte_count = resp[i + 2];
-    if (byte_count == 0 || byte_count % 2 != 0)
-      continue;
-    if (i + 3 + byte_count + 2 > resp.size())
-      continue;
-
-    uint8_t n = byte_count / 2;
-    regs.resize(n);
-    for (uint8_t r = 0; r < n; r++)
-      regs[r] = ((uint16_t) resp[i + 3 + r * 2] << 8) | resp[i + 4 + r * 2];
-    return true;
+  uint8_t cs = 0;
+  for (size_t i = 1; i < resp.size() - 2; i++)
+    cs += resp[i];
+  if (cs != resp[resp.size() - 2]) {
+    ESP_LOGW(TAG, "V5 checksum mismatch (0x%02X, frame says 0x%02X)", cs, resp[resp.size() - 2]);
+    return false;
   }
 
-  ESP_LOGW(TAG, "Modbus reply not found in V5 frame (%u bytes)", (unsigned) resp.size());
-  return false;
+  const size_t mb_len = resp.size() - 2 - MB;  // Modbus bytes between header and trailer
+  const uint8_t *mb = resp.data() + MB;
+  if (mb[1] == (MODBUS_FC_READ_HOLDING_REGISTERS | 0x80)) {
+    ESP_LOGW(TAG, "Inverter returned Modbus exception %u", mb_len >= 3 ? mb[2] : 0);
+    return false;
+  }
+  if (mb[0] != 0x01 || mb[1] != MODBUS_FC_READ_HOLDING_REGISTERS) {
+    ESP_LOGW(TAG, "Unexpected Modbus header %02X %02X", mb[0], mb[1]);
+    return false;
+  }
+  const uint8_t byte_count = mb[2];
+  if (byte_count != count * 2 || mb_len < 3u + byte_count + 2u) {
+    ESP_LOGW(TAG, "Modbus reply has %u data bytes, expected %u", byte_count, count * 2);
+    return false;
+  }
+  uint16_t crc = crc16(mb, 3 + byte_count);
+  uint16_t got = (uint16_t) mb[3 + byte_count] | ((uint16_t) mb[4 + byte_count] << 8);
+  if (crc != got) {
+    ESP_LOGW(TAG, "Modbus CRC mismatch (0x%04X, frame says 0x%04X)", crc, got);
+    return false;
+  }
+
+  regs.resize(count);
+  for (uint8_t r = 0; r < count; r++)
+    regs[r] = ((uint16_t) mb[3 + r * 2] << 8) | mb[4 + r * 2];
+  return true;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

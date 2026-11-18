@@ -19,6 +19,14 @@ in at runtime from the web UI instead of being hardcoded in YAML.
 > Other Deye models place these values at different addresses. On unfamiliar
 > hardware, run `scan_registers()` first — see
 > [Confirming the register map](#confirming-the-register-map).
+>
+> **This fork** (`xolarkodak/esphome-solarman`) adds grid voltage and
+> frequency, battery capacity (Ah and kWh), battery current and temperature,
+> PV3/PV4 strings, per-string current and total PV power — and fixes two
+> reply-parsing bugs (see [Changes in this fork](#changes-in-this-fork)).
+> The new addresses come from the Deye single-phase Modbus map and the
+> ha-solarman `deye_hybrid` profile; they have not yet been cross-checked on
+> live hardware the way the original set was.
 
 ## Read-only by design
 
@@ -38,9 +46,12 @@ adding a write would have to be a deliberate change rather than an accident.
 
 ```yaml
 external_components:
-  - source: github://zerogrid-srl/esphome-solarman@v0.1.0
+  - source: github://xolarkodak/esphome-solarman@v0.6.0
     components: [solarman_minimal]
 ```
+
+This is all ESPHome Builder (the Home Assistant add-on) needs: it fetches the
+component from GitHub at build time. The repository has to be public.
 
 Pin a tag, not a branch. A branch moves under you, and the first sign is a build
 that fails without you having changed anything.
@@ -66,6 +77,22 @@ solarman_minimal:
     name: "PV1 power"
   pv2_power:
     name: "PV2 power"
+  pv3_power:
+    name: "PV3 power"
+  pv3_voltage:
+    name: "PV3 voltage"
+  pv3_current:
+    name: "PV3 current"
+  pv_power:
+    name: "PV total power"      # PV1 + PV2 + PV3 + PV4
+  grid_voltage:
+    name: "Grid voltage"        # AC input of the inverter, L1-N
+  grid_frequency:
+    name: "Grid frequency"
+  battery_capacity:
+    name: "Battery capacity"    # Ah, as configured on the inverter
+  battery_capacity_energy:
+    name: "Battery capacity kWh" # Ah x battery_nominal_voltage
   daily_production:
     name: "Daily production"
   total_production:
@@ -83,8 +110,42 @@ solarman_minimal:
 ```
 
 All sensors are optional — declare only what you need. Also available:
-`battery_voltage`, `pv1_voltage`, `pv2_voltage`, `total_consumption`,
-`daily_battery_charge`, `daily_battery_discharge`.
+`battery_voltage`, `battery_current` (signed, + discharging),
+`battery_temperature`, `pv1_voltage`/`pv2_voltage`/`pv4_voltage`,
+`pv1_current`/`pv2_current`/`pv4_current`, `pv4_power`,
+`total_consumption`, `daily_battery_charge`, `daily_battery_discharge`.
+
+`battery_nominal_voltage` (default `51.2V`, a 16-cell LiFePO4 bank) is used only
+to turn the Ah capacity into `battery_capacity_energy`. Set it to `48V` or
+whatever your bank is rated at.
+
+### Full register map
+
+| Key | Register | Scale | Notes |
+|---|---|---|---|
+| `device_state` | 0x003B | 1 | 0 standby, 1 self-test, 2 normal, 3 alarm, 4 fault |
+| `daily_battery_charge` / `_discharge` | 0x0046 / 0x0047 | 0.1 kWh | |
+| `daily_energy_bought` / `_sold` | 0x004C / 0x004D | 0.1 kWh | |
+| `grid_frequency` | 0x004F | 0.01 Hz | **new** |
+| `daily_consumption` | 0x0054 | 0.1 kWh | |
+| `total_consumption` | 0x0055-56 | 0.1 kWh | 32-bit, low word first |
+| `total_production` | 0x0060-61 | 0.1 kWh | 32-bit, low word first |
+| `daily_production` | 0x006C | 0.1 kWh | |
+| `pvN_voltage` | 0x006D + 2(N-1) | 0.1 V | PV3/PV4 **new** |
+| `pvN_current` | 0x006E + 2(N-1) | 0.1 A | **new** |
+| `grid_voltage` | 0x0096 | 0.1 V | **new**, grid side L1-N |
+| `grid_power` | 0x00A9 | 1 W | signed, direction unconfirmed |
+| `load_power` | 0x00B2 | 1 W | |
+| `battery_temperature` | 0x00B6 | 0.1 °C, −100 | **new**, NaN when 0 (no probe) |
+| `battery_voltage` | 0x00B7 | 0.01 V | |
+| `battery_soc` | 0x00B8 | 1 % | |
+| `pvN_power` | 0x00BA + (N-1) | 1 W | PV3/PV4 **new** |
+| `battery_power` | 0x00BE | 1 W | signed, + discharging |
+| `battery_current` | 0x00BF | 0.01 A | **new**, signed, + discharging |
+| `grid_connected` | 0x00C2 | 0/1 | |
+| `battery_capacity` | 0x00CC | 1 Ah | **new**, the inverter's Batt Capacity setting |
+
+Still two TCP round trips per poll: 0x003B-0x0074 and 0x0096-0x00CC.
 
 `device_state` and `grid_connected` are numeric rather than text or binary
 sensors: this component creates its own entities, and one entity type keeps a
@@ -112,8 +173,10 @@ text:
 ## Confirming the register map
 
 Deye firmware variants place registers at different addresses. Single-phase
-hybrids (`SUN-xK-SG05LP1`) keep battery, PV, grid and load around registers
-580-700, while other models use a lower block. `scan_registers()` reads both
+low-voltage hybrids (`SUN-xK-SG0xLP1`) use the low block this component reads
+(0x003B-0x00CC). Three-phase hybrids (`SG0xLP3`, `SG0xHP3`) keep battery, PV,
+grid and load around registers 500-700 instead, and are **not** supported by
+the built-in map. `scan_registers()` reads both
 families and logs every **non-zero** register, so one run identifies the layout:
 
 ```yaml
@@ -155,6 +218,36 @@ re-discovered only after several consecutive read failures — so a single dropp
 packet does not throw away a working address.
 
 Registers are read in batches rather than one connection per value.
+
+## Changes in this fork
+
+**New sensors** — see the register table above.
+
+**Reply parsing fixed.** The Modbus payload used to be located by scanning the
+V5 frame from byte 11 for the bytes `01 03`. The V5 status byte is `0x01`, so
+whenever the low byte of the logger's working-time counter happened to be
+`0x03` (about one poll in 900 in a simulation over random counters - at a
+30 s interval, roughly one bad reading every 7-8 hours) the timestamp bytes were decoded as register
+values and published — an occasional absurd spike on the screen. The payload
+is now read at its fixed offset (25) and checked against both the V5 checksum
+and the Modbus CRC; a corrupt frame is a failed poll, never a wrong number.
+Modbus exception replies are recognised and logged.
+
+**Short reads fixed.** The receive loop stopped after `29 + 2·count` bytes, three
+bytes short of a real reply (`32 + 2·count`). It only worked because the reply
+usually arrives in one TCP segment. Frames are now sized from their own length
+field, and unsolicited frames the logger pushes into the stream are skipped.
+
+**Indexes replaced by addresses.** Values are looked up by register address,
+not by position in the batch, so widening a batch cannot silently move a
+sensor onto the wrong register.
+
+**`millis()` wrap.** Timeouts used `millis() < deadline`, which misbehaves after
+~49.7 days of uptime. They now compare a signed difference.
+
+**`status_line()` in English** (was Italian), plain ASCII so LVGL fonts can draw it.
+
+**`host:`** is validated as an IPv4 address at config time.
 
 ## Licence
 

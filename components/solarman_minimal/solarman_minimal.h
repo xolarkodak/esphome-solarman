@@ -2,6 +2,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
+#include "esphome/core/log.h"
 #include "esphome/components/sensor/sensor.h"
 
 #include <string>
@@ -166,10 +167,18 @@ class SolarmanMinimal : public PollingComponent {
   std::string host_str() const;
 
   // ── Sensors ──────────────────────────────────────────────────────────────
-  void set_pv1_power_sensor(sensor::Sensor *s)        { pv1_power_ = s; }
-  void set_pv1_voltage_sensor(sensor::Sensor *s)      { pv1_voltage_ = s; }
-  void set_pv2_power_sensor(sensor::Sensor *s)        { pv2_power_ = s; }
-  void set_pv2_voltage_sensor(sensor::Sensor *s)      { pv2_voltage_ = s; }
+  // PV strings 1..4 (index 0..3). One setter each so codegen stays a flat table.
+  void set_pv_power_sensor(uint8_t n, sensor::Sensor *s)   { pv_power_sensors_[n] = s; }
+  void set_pv_voltage_sensor(uint8_t n, sensor::Sensor *s) { pv_voltage_sensors_[n] = s; }
+  void set_pv_current_sensor(uint8_t n, sensor::Sensor *s) { pv_current_sensors_[n] = s; }
+  void set_pv_total_power_sensor(sensor::Sensor *s)   { pv_power_ = s; }
+  void set_grid_voltage_sensor(sensor::Sensor *s)     { grid_voltage_ = s; }
+  void set_grid_frequency_sensor(sensor::Sensor *s)   { grid_frequency_ = s; }
+  void set_battery_current_sensor(sensor::Sensor *s)  { battery_current_ = s; }
+  void set_battery_temperature_sensor(sensor::Sensor *s) { battery_temperature_ = s; }
+  void set_battery_capacity_sensor(sensor::Sensor *s) { battery_capacity_ = s; }
+  void set_battery_capacity_energy_sensor(sensor::Sensor *s) { battery_capacity_energy_ = s; }
+  void set_battery_nominal_voltage(float v)           { battery_nominal_voltage_ = v; }
   void set_battery_soc_sensor(sensor::Sensor *s)      { battery_soc_ = s; }
   void set_battery_voltage_sensor(sensor::Sensor *s)  { battery_voltage_ = s; }
   void set_battery_power_sensor(sensor::Sensor *s)    { battery_power_ = s; }
@@ -192,10 +201,10 @@ class SolarmanMinimal : public PollingComponent {
   // right one and a dead port.
   std::string status_line() const {
     if (serial_ == 0 && host_addr_ == 0)
-      return "nessun logger trovato sulla rete";
-    std::string h = host_addr_ == 0 ? std::string("indirizzo sconosciuto") : host_str();
+      return "no logger found on the network";
+    std::string h = host_addr_ == 0 ? std::string("address unknown") : host_str();
     if (serial_ == 0)
-      return h + "  (seriale non impostato)";
+      return h + "  (serial not set)";
     char b[96];
     snprintf(b, sizeof(b), "%s  sn %u", h.c_str(), (unsigned) serial_);
     std::string out(b);
@@ -211,12 +220,15 @@ class SolarmanMinimal : public PollingComponent {
   void note_error(const char *what, int err) {
     const char *why;
     switch (err) {
-      case 111: why = "porta chiusa"; break;          // ECONNREFUSED
-      case 113: why = "host irraggiungibile"; break;  // EHOSTUNREACH
-      case 118: why = "rete irraggiungibile"; break;  // ENETUNREACH
-      case 110: why = "nessuna risposta"; break;      // ETIMEDOUT
-      case 0:   why = "nessuna risposta"; break;      // our own select() timeout
-      default:  why = "errore"; break;
+      // Plain ASCII on purpose: this string goes to LVGL labels, whose fonts
+      // often carry nothing beyond the basic Latin range.
+      case 111: why = "port closed"; break;       // ECONNREFUSED
+      case 113: why = "host unreachable"; break;  // EHOSTUNREACH
+      case 118: why = "network unreachable"; break;  // ENETUNREACH
+      case 110: why = "no answer"; break;         // ETIMEDOUT
+      case 0:   why = "no answer"; break;         // our own select() timeout
+      case -1:  why = "bad reply"; break;         // frame arrived but did not parse
+      default:  why = "error"; break;
     }
     char b[64];
     snprintf(b, sizeof(b), "%s: %s (%d)", what, why, err);
@@ -267,10 +279,17 @@ class SolarmanMinimal : public PollingComponent {
   ESPPreferenceObject prefs_;
   ESPPreferenceObject serial_prefs_;
 
-  sensor::Sensor *pv1_power_{nullptr};
-  sensor::Sensor *pv1_voltage_{nullptr};
-  sensor::Sensor *pv2_power_{nullptr};
-  sensor::Sensor *pv2_voltage_{nullptr};
+  sensor::Sensor *pv_power_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
+  sensor::Sensor *pv_voltage_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
+  sensor::Sensor *pv_current_sensors_[4]{nullptr, nullptr, nullptr, nullptr};
+  sensor::Sensor *pv_power_{nullptr};  // sum of PV1..PV4
+  sensor::Sensor *grid_voltage_{nullptr};
+  sensor::Sensor *grid_frequency_{nullptr};
+  sensor::Sensor *battery_current_{nullptr};
+  sensor::Sensor *battery_temperature_{nullptr};
+  sensor::Sensor *battery_capacity_{nullptr};
+  sensor::Sensor *battery_capacity_energy_{nullptr};
+  float battery_nominal_voltage_{51.2f};
   sensor::Sensor *battery_soc_{nullptr};
   sensor::Sensor *battery_voltage_{nullptr};
   sensor::Sensor *battery_power_{nullptr};
@@ -299,7 +318,7 @@ class SolarmanMinimal : public PollingComponent {
   static uint32_t parse_discovery_serial(const char *reply);
   bool read_registers(uint16_t start, uint8_t count, std::vector<uint16_t> &out);
   std::vector<uint8_t> build_v5_request(uint16_t reg_start, uint8_t reg_count);
-  bool parse_v5_response(const std::vector<uint8_t> &resp, std::vector<uint16_t> &regs);
+  bool parse_v5_response(const std::vector<uint8_t> &resp, uint8_t count, std::vector<uint16_t> &regs);
   // The logger's own serial, taken from any V5 frame it sends back - including
   // one that rejects our request. Offset 7, four bytes, low byte first.
   static uint32_t frame_serial(const std::vector<uint8_t> &frame);
