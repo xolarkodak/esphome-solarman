@@ -569,14 +569,14 @@ void SolarmanMinimal::scan_registers() {
       {0x0054, 14, "1P: energy totals (incl. 0x0060 total production)"},
       {0x0060, 12, "3P: battery settings, capacity 0x0066"},
       {0x0068, 13, "1P: daily yield + PV1-PV4 voltage / current"},
-      {0x0096, 16, "1P: grid voltage / current"},
+      {0x0096, 16, "1P: grid voltage / current, load voltage 0x009D"},
       {0x00A5, 28, "1P: grid power, load power, battery, PV1-PV4 power"},
       {0x00C0, 16, "1P: battery extras, battery capacity 0x00CC"},
       {0x01F4, 8, "3P: device state 0x01F4"},
       {0x0202, 24, "3P: energy counters"},
       {0x024A, 16, "3P: battery, grid voltage L1-L3"},
       {0x0261, 20, "3P: grid frequency, grid power"},
-      {0x0286, 10, "3P: load power L1-L3 / total"},
+      {0x0284, 10, "3P: load voltage L1-L3, load power L1-L3 / total"},
       {0x02A0, 12, "3P: PV1-PV4 power, voltage, current"},
   };
 

@@ -44,7 +44,7 @@ live installation. Custom sensors can only *read* a register, too.
 
 ```yaml
 external_components:
-  - source: github://xolarkodak/esphome-solarman@v0.7.0
+  - source: github://xolarkodak/esphome-solarman@v0.7.1
     components: [solarman_minimal]
 ```
 
@@ -80,6 +80,8 @@ solarman_minimal:
     name: "Grid voltage"             # AC input of the inverter (L1 on 3-phase)
   grid_power:
     name: "Grid power"               # signed; direction not yet confirmed
+  load_voltage:
+    name: "Load voltage"             # LOAD output - what goes into the house
   load_power:
     name: "Load power"
   pv1_power:
@@ -113,6 +115,8 @@ possible; the read plan is printed to the log at startup.
 | `grid_frequency` | 0x004F | 0x0261 | 0.01 Hz | |
 | `grid_power` | 0x00A9 | 0x0271 | 1 W, signed | sign unconfirmed |
 | `grid_connected` | 0x00C2 | — | 0/1 | |
+| `load_voltage` | 0x009D | 0x0284 | 0.1 V | LOAD output, what goes into the house (L1 on 3-phase) |
+| `load_voltage_l2` / `_l3` | — | 0x0285 / 0x0286 | 0.1 V | three-phase only |
 | `load_power` | 0x00B2 | 0x028D | 1 W | |
 | `load_power_l1` / `_l2` / `_l3` | — | 0x028A..0x028C | 1 W | three-phase only |
 | `battery_soc` | 0x00B8 | 0x024C | 1 % | |
@@ -240,6 +244,11 @@ Each poll reads its blocks **one per main-loop pass**, not all at once, so a
 slow logger holds up the screen for one read at a time.
 
 ## Changes in this fork
+
+### v0.7.1
+
+- **`load_voltage`** (and `_l2`/`_l3` on three-phase): voltage on the
+  inverter's LOAD output, i.e. what the house receives.
 
 ### v0.7.0
 

@@ -14,7 +14,7 @@ esp32:
 
 external_components:
   # In your own config, use the published tag instead:
-  #   - source: github://xolarkodak/esphome-solarman@v0.7.0
+  #   - source: github://xolarkodak/esphome-solarman@v0.7.1
   #     components: [solarman_minimal]
   - source:
       type: local
@@ -82,6 +82,8 @@ solarman_minimal:
     name: "Device type"
   grid_power:
     name: "Grid power"
+  load_voltage:
+    name: "Load voltage"
   load_power:
     name: "Load power"
   daily_production:

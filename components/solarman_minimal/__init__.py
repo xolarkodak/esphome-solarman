@@ -192,7 +192,12 @@ SENSORS = {
     "grid_power": (_power, {SP: R(0x00A9, "s16"), **_p3(R(0x0271, "s16"))}),
     # 1 = tied to the utility, 0 = islanded.
     "grid_connected": (_plain, {SP: R(0x00C2, flags=BOOL)}),
-    # ── Load
+    # ── Load (the inverter's backup/LOAD output - what goes into the house)
+    # SP 0x009D, 3P 0x0284..0x0286 (L1..L3), x0.1 V. From the Deye Modbus map;
+    # compare with the inverter's display before trusting it.
+    "load_voltage": (_voltage(1), {SP: R(0x009D, scale=0.1), **_p3(R(0x0284, scale=0.1))}),
+    "load_voltage_l2": (_voltage(1), _p3(R(0x0285, scale=0.1))),
+    "load_voltage_l3": (_voltage(1), _p3(R(0x0286, scale=0.1))),
     "load_power": (_power, {SP: R(0x00B2, "s16"), **_p3(R(0x028D, "s16"))}),
     "load_power_l1": (_power, _p3(R(0x028A, "s16"))),
     "load_power_l2": (_power, _p3(R(0x028B, "s16"))),
